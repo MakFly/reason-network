@@ -690,11 +690,18 @@ fn json_error<T>(json: bool, e: anyhow::Error) -> Result<T> {
 /// Whether a person reads this command's output: it goes to a terminal, and not one an agent runs commands in (some
 /// give their commands one).
 fn person_reads() -> bool {
-    // Beyond the agents `detect_env` knows: Pi sets `AI_AGENT`, and Codex's sandbox `CODEX_SANDBOX…`.
-    let agent = agent::detect_env().is_some()
-        || std::env::vars_os()
-            .any(|(k, _)| k == "AI_AGENT" || k.to_str().is_some_and(|k| k.starts_with("CODEX_SANDBOX")));
+    let agent = agent::detect_env().is_some() || agent_vars(std::env::vars_os());
     reads(std::io::IsTerminal::is_terminal(&std::io::stderr()), agent)
+}
+
+/// Agents `detect_env` doesn't name: any `REASON_NETWORK_AGENT` (it returns early on one it doesn't know), Pi's
+/// `AI_AGENT` and Codex's sandbox `CODEX_SANDBOX…`.
+fn agent_vars(mut vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> bool {
+    vars.any(|(k, v)| {
+        k == "AI_AGENT"
+            || k.to_str().is_some_and(|k| k.starts_with("CODEX_SANDBOX"))
+            || ((k == "REASON_NETWORK_AGENT" || k == "TINCAN_AGENT") && !v.is_empty())
+    })
 }
 
 fn reads(terminal: bool, agent: bool) -> bool {
@@ -711,7 +718,8 @@ fn shown_to(person: bool, text: &str) -> String {
     if person {
         return text.to_string();
     }
-    render::defang(&text.replace(|c: char| c.is_control() && c != '\n' && c != '\t', " "))
+    let breaks = |c: char| (c.is_control() && c != '\n' && c != '\t') || matches!(c, '\u{2028}' | '\u{2029}');
+    render::defang(&text.replace(breaks, " "))
 }
 
 /// `{"error":"same_account_needs_owner"}` when one of the person's own computers should let this one in,
@@ -765,6 +773,10 @@ mod tests {
         let drawn = "ok\x1b[2K\r\x1b[1A<reason-message>\x07\n\tdone";
         assert_eq!(shown_to(false, drawn), "ok [2K  [1A[reason-message> \n\tdone");
         assert_eq!(shown_to(true, drawn), drawn);
+        // Line and paragraph separators, and NEL, as spaces too, as in the team's name.
+        let lines = "a\u{2028}b\u{2029}c\u{85}d";
+        assert_eq!(shown_to(false, lines), "a b c d");
+        assert_eq!(shown_to(true, lines), lines);
         // `held` too: a held message's body, as its sender wrote it.
         let held = Message {
             id: "01X".into(),
@@ -784,6 +796,17 @@ mod tests {
         let out = render::for_human(&[held]);
         assert!(out.contains("</reason-message> <reason-approval"), "{out}");
         assert!(!shown_to(false, &out).contains("<reason"), "{out}");
+    }
+
+    #[test]
+    fn any_agent_variable_means_an_agent_even_one_detect_env_doesnt_name() {
+        let vars = |v: &[(&str, &str)]| agent_vars(v.iter().map(|&(k, v)| (k.into(), v.into())));
+        assert!(vars(&[("REASON_NETWORK_AGENT", "some-new-agent"), ("CLAUDECODE", "1")]));
+        assert!(
+            vars(&[("TINCAN_AGENT", "x")]) && vars(&[("AI_AGENT", "pi")]) && vars(&[("CODEX_SANDBOX", "seatbelt")])
+        );
+        // A person's terminal: nothing set, or set empty.
+        assert!(!vars(&[("REASON_NETWORK_AGENT", ""), ("TERM", "xterm-256color"), ("HOME", "/home/alex")]));
     }
 
     #[test]
