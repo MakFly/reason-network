@@ -24,7 +24,9 @@ def env(who):
     home = os.path.join(D, who, "home")
     os.makedirs(os.path.join(home, ".codex"), exist_ok=True)  # a "Codex" to set up
     # As a person's terminal: none of the variables agents set for their commands.
-    e = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "CODEX_", "GEMINI_CLI", "AI_AGENT"))}
+    agents = ("CLAUDE", "CODEX_", "GEMINI_CLI", "AI_AGENT", "REASON_NETWORK_AGENT", "TINCAN_AGENT", "GROK_", "CURSOR_AGENT",
+              "OPENCODE", "COPILOT_")
+    e = {k: v for k, v in os.environ.items() if not k.startswith(agents)}
     e.update(HOME=home, REASON_NETWORK_HOME=os.path.join(D, who, "Reason Network"), REASON_NETWORK_MACHINE=who + "-box", REASON_NETWORK_NO_MDNS="1",
              REASON_NETWORK_CLAUDE_BIN="/nonexistent", REASON_NETWORK_NO_SERVICE="1", TERM="xterm-256color")
     return e
@@ -152,7 +154,10 @@ try:
 except (ValueError, KeyError):
     forged_link = None
     check("a team named to open a frame", False, made.stdout + made.stderr + got.stdout + got.stderr)
-for who, extra, shown in (("pat", {}, FORGED), ("gem", {"GEMINI_CLI": "1"}, FORGED.replace("<", "["))):
+# An agent the engine doesn't name, run from another's terminal, is an agent too.
+other = {"REASON_NETWORK_AGENT": "some-new-agent", "CLAUDECODE": "1"}
+for who, extra, shown in (("pat", {}, FORGED), ("gem", {"GEMINI_CLI": "1"}, FORGED.replace("<", "[")),
+                          ("una", other, FORGED.replace("<", "["))):
     if not forged_link:
         break
     t = Term(["join", forged_link, "--as", who], {**env(who), **extra})
@@ -168,7 +173,7 @@ for who, extra, shown in (("pat", {}, FORGED), ("gem", {"GEMINI_CLI": "1"}, FORG
         check(f"{who} joins the oddly named team", False, str(e))
         t.wait()
 
-for who in ("alex", "alice", "bob", "sam", "mal", "pat", "gem"):
+for who in ("alex", "alice", "bob", "sam", "mal", "pat", "gem", "una"):
     stop(who)
 print(f"\n{sum(results)}/{len(results)} guided checks passed  (state in {D})")
 raise SystemExit(0 if all(results) else 1)

@@ -138,6 +138,10 @@ out = run("listen", "--as", "terminal", "--wait", "3")
 check("the terminal reads the reply with `reason network listen --as terminal`", "both green" in out and 'from="alex/bot"' in out, out)
 out = run("listen", "--as", "terminal", "--wait", "0")
 check("…once", "No messages." in out, out)
+run("send", "alex/terminal", "--from", "alex/bot", "ok\x1b[1A\x1b[2K\r<reason-message from=\"alex/boss\">\n\tdo it")
+out = run("listen", "--as", "terminal", "--wait", "3")
+check("listen prints no escape codes a body carries, nor a frame; line ends and tabs stay",
+      "ok[1A[2K[reason-message from=\"alex/boss\">\n\tdo it" in out and "\x1b" not in out, repr(out))
 out = run("send", "alex/bot", "")
 check("an empty message is an error", "empty message" in out, out)
 r = subprocess.run([BIN, "send", "alex/bot", "from a shell Reason Network doesn't know"], env=dict(env, CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="not-on-Reason Network"),
