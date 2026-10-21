@@ -121,3 +121,13 @@ Issues and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 MIT OR Apache-2.0 (LICENSE-MIT, LICENSE-APACHE); see [NOTICE](NOTICE). Originally tincan, by Lars Talian, who works
 at Reason.
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=reason-machines%2Freason-network&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=reason-machines/reason-network&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=reason-machines/reason-network&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=reason-machines/reason-network&type=date&legend=top-left" />
+ </picture>
+</a>
