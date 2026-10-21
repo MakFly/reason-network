@@ -215,6 +215,9 @@ async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T> {
     Ok(serde_json::from_slice(&buf)?)
 }
 
+/// How long a join waits on each machine on the link.
+const JOIN_WAIT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 25 });
+
 /// How a join went: the team and the machine that let this one in, or why not; and whether a machine on the link
 /// couldn't be reached (it may yet be, shortly).
 pub struct Joined {
@@ -225,12 +228,11 @@ pub struct Joined {
 /// Joins a team: asks each machine in turn (the ticket's, or the one an invite code points at) to let us in. Never
 /// this machine, which a link it made itself names first.
 pub async fn join(endpoint: &Endpoint, peers: &[EndpointAddr], req: &JoinRequest) -> Joined {
+    let named = peers.len();
     let peers: Vec<&EndpointAddr> = peers.iter().filter(|a| a.id != endpoint.id()).collect();
-    let mut last = if peers.is_empty() {
-        anyhow!("this link names only this computer, which can't let itself in: ask a teammate for a fresh link")
-    } else {
-        anyhow!("the invite lists no machines")
-    };
+    let skipped_me = peers.len() < named;
+    // Why the last machine asked didn't answer.
+    let mut last = None;
     let mut refused = Refusals::default();
     let mut unreachable = false;
     for addr in peers {
@@ -243,7 +245,7 @@ pub async fn join(endpoint: &Endpoint, peers: &[EndpointAddr], req: &JoinRequest
             conn.close(0u32.into(), b"joined");
             anyhow::Ok(reply)
         };
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+        let deadline = tokio::time::Instant::now() + JOIN_WAIT;
         let reply = loop {
             match tokio::time::timeout_at(deadline, attempt()).await {
                 // An invite made seconds ago may not have published its address yet: look again shortly.
@@ -264,15 +266,32 @@ pub async fn join(endpoint: &Endpoint, peers: &[EndpointAddr], req: &JoinRequest
             }
             Ok(Err(e)) => {
                 unreachable = true;
-                last = e;
+                last = Some(e);
             }
             Err(_) => {
                 unreachable = true;
-                last = anyhow!("couldn't reach the machine that made the invite (is it online?)");
+                last = Some(if named > 1 {
+                    anyhow!("couldn't reach any machine on this link (are they online?)")
+                } else {
+                    anyhow!("couldn't reach the machine that made the invite (is it online?)")
+                });
             }
         }
     }
-    Joined { result: Err(refused.0.map_or(last, |r| anyhow!(r))), unreachable }
+    let e = match (refused.0, last) {
+        (Some(r), _) => anyhow!(r),
+        // Asked of a teammate: a link names at most the machine that made it (this one) and two others.
+        (None, Some(_)) if skipped_me => anyhow!(
+            "none of the other machines on this link answered (are they online?), and this computer can't let itself \
+             in: ask an online teammate for a fresh link"
+        ),
+        (None, Some(e)) => e,
+        (None, None) if skipped_me => {
+            anyhow!("this link names only this computer, which can't let itself in: ask a teammate for a fresh link")
+        }
+        (None, None) => anyhow!("the invite lists no machines"),
+    };
+    Joined { result: Err(e), unreachable }
 }
 
 /// What the machines asked so far refused a join with. A refusal is final: another machine would say the same. Except
@@ -892,6 +911,27 @@ mod tests {
         let e = joined.result.err().unwrap().to_string();
         assert!(e.contains("names only this computer"), "{e}");
         assert!(!joined.unreachable);
+    }
+
+    #[tokio::test]
+    async fn a_link_naming_this_machine_and_offline_ones_says_to_ask_an_online_teammate() {
+        let key = SecretKey::generate();
+        let endpoint = bind(key.clone(), Some("https://relay.example.com"), false).await.unwrap();
+        let req = JoinRequest {
+            team: String::new(),
+            secret: String::new(),
+            person: "alex".into(),
+            machine: "mini".into(),
+            proof: None,
+            owner_only: false,
+        };
+        let peers = [EndpointAddr::new(key.public()), EndpointAddr::new(SecretKey::generate().public())];
+        let joined = join(&endpoint, &peers, &req).await;
+        endpoint.close().await;
+        let e = joined.result.err().unwrap().to_string();
+        assert!(e.contains("can't let itself in") && e.contains("ask an online teammate for a fresh link"), "{e}");
+        assert!(!e.contains("made the invite"), "{e}");
+        assert!(joined.unreachable);
     }
 
     #[test]
