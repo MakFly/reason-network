@@ -341,8 +341,8 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok().and_then(|s| serde_json::from_str(&s).ok())).collect())
     }
 
-    pub fn outbox_done(&self, id: &str) -> Result<()> {
-        self.db.execute("DELETE FROM outbox WHERE id = ?1", [id])?;
+    pub fn outbox_done(&self, target: &str, id: &str) -> Result<()> {
+        self.db.execute("DELETE FROM outbox WHERE id = ?1 AND target = ?2", [id, target])?;
         Ok(())
     }
 
@@ -649,6 +649,17 @@ mod tests {
 
     fn file(name: &str, content: &str) -> Attachment {
         Attachment { name: name.into(), content: content.into(), path: None }
+    }
+
+    #[test]
+    fn only_the_target_machine_takes_a_message_off_the_outbox() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let m = with_files("01OUT", "bob/api");
+        store.outbox_add("bob-machine", &m).unwrap();
+        store.outbox_done("mallory-machine", "01OUT").unwrap();
+        assert_eq!(store.outbox_for("bob-machine", m.sent_at).unwrap().len(), 1);
+        store.outbox_done("bob-machine", "01OUT").unwrap();
+        assert!(store.outbox_for("bob-machine", m.sent_at).unwrap().is_empty());
     }
 
     fn with_files(id: &str, to: &str) -> Message {
