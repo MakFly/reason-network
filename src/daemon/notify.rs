@@ -71,14 +71,62 @@ pub(super) fn notify_send() -> Option<Command> {
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(super) fn notify_send_at(bin: std::path::PathBuf) -> Option<Command> {
     let mut cmd = Command::new(bin);
-    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
-        let bus = format!("/run/user/{}/bus", unsafe { libc::getuid() });
-        if !std::path::Path::new(&bus).exists() {
-            return None;
+    let bus = match std::env::var_os("DBUS_SESSION_BUS_ADDRESS") {
+        Some(bus) => bus,
+        None => {
+            let bus = format!("/run/user/{}/bus", unsafe { libc::getuid() });
+            if !std::path::Path::new(&bus).exists() {
+                return None;
+            }
+            format!("unix:path={bus}").into()
         }
-        cmd.env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={bus}"));
+    };
+    // Linger keeps a user bus up with nobody at the screen (a server, a box reached over SSH): only a notification
+    // server on it makes a desktop, running or one the bus starts on demand.
+    if !notifications_on(&bus) {
+        return None;
     }
+    cmd.env("DBUS_SESSION_BUS_ADDRESS", bus);
     Some(cmd)
+}
+
+/// Whether the bus at `bus` has a notification server: one running, or one it starts on demand (dunst, mako, MATE's).
+/// Only a clear no counts: without busctl, or on a bus it can't reach, notify-send finds out. It's asked under the
+/// daemon's lock, so a bus that hangs gets a second in all (`--timeout` doesn't cover connecting).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn notifications_on(bus: &std::ffi::OsStr) -> bool {
+    const NAME: &str = "org.freedesktop.Notifications";
+    let Some(busctl) = super::ask::asker_bin("busctl", &["/usr/bin/busctl", "/run/current-system/sw/bin/busctl"])
+    else {
+        return true;
+    };
+    let call = |args: &[&str]| {
+        Command::new(&busctl)
+            .env("DBUS_SESSION_BUS_ADDRESS", bus)
+            .args(["--user", "--timeout=1", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus"])
+            .arg("org.freedesktop.DBus")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()
+    };
+    let calls = [call(&["NameHasOwner", "s", NAME]), call(&["ListActivatableNames"])];
+    let until = Instant::now() + Duration::from_secs(1);
+    let [owned, activatable] = calls.map(|child| {
+        let mut child = child?;
+        while matches!(child.try_wait(), Ok(None)) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let _ = child.kill();
+        child.wait_with_output().ok().filter(|o| o.status.success()).map(|o| o.stdout)
+    });
+    // `as 2 "org.freedesktop.DBus" "org.freedesktop.Notifications"`
+    let quoted = format!("\"{NAME}\"");
+    let unowned = owned.is_some_and(|o| o.trim_ascii() == b"b false");
+    let unlisted = activatable.is_some_and(|o| !o.windows(quoted.len()).any(|w| w == quoted.as_bytes()));
+    !(unowned && unlisted)
 }
 
 /// Most notification servers read markup.
@@ -115,4 +163,66 @@ pub(super) fn powershell_at(bin: std::path::PathBuf, script: &str) -> Command {
     // CREATE_NO_WINDOW: no console flashing up next to the notification.
     cmd.creation_flags(0x0800_0000);
     cmd
+}
+
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod tests {
+    use super::*;
+    use std::io::BufRead;
+
+    /// A private session bus whose only service directory is `services`, so what the host has installed doesn't count.
+    fn bus(services: &[&str]) -> Option<(std::process::Child, String, std::path::PathBuf)> {
+        let daemon = agent::find_bin("dbus-daemon").filter(|_| agent::find_bin("busctl").is_some())?;
+        let dir = std::env::temp_dir().join(format!("reason-network-bus-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(dir.join("services")).unwrap();
+        for name in services {
+            let service = format!("[D-BUS Service]\nName={name}\nExec=/nonexistent\n");
+            std::fs::write(dir.join("services").join(format!("{name}.service")), service).unwrap();
+        }
+        let config = format!(
+            r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir={tmp}</listen>
+  <servicedir>{tmp}/services</servicedir>
+  <policy context="default"><allow send_destination="*" eavesdrop="true"/><allow eavesdrop="true"/><allow own="*"/></policy>
+</busconfig>"#,
+            tmp = dir.display()
+        );
+        std::fs::write(dir.join("bus.conf"), config).unwrap();
+        let mut bus = Command::new(daemon)
+            .arg(format!("--config-file={}", dir.join("bus.conf").display()))
+            .args(["--nofork", "--print-address"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut address = String::new();
+        std::io::BufReader::new(bus.stdout.take().unwrap()).read_line(&mut address).unwrap();
+        Some((bus, address.trim().to_string(), dir))
+    }
+
+    fn notifications_on_bus(services: &[&str]) -> Option<bool> {
+        let (mut bus, address, dir) = bus(services)?;
+        let on = notifications_on(address.as_ref());
+        bus.kill().unwrap();
+        bus.wait().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        Some(on)
+    }
+
+    #[test]
+    fn a_bus_without_a_notification_server_is_no_desktop() {
+        let Some(on) = notifications_on_bus(&["org.example.Other"]) else { return };
+        assert!(!on);
+        // A bus it can't reach is left to notify-send.
+        assert!(notifications_on("unix:path=/nonexistent".as_ref()));
+    }
+
+    #[test]
+    fn a_notification_server_the_bus_starts_on_demand_is_a_desktop() {
+        let Some(on) = notifications_on_bus(&["org.freedesktop.Notifications"]) else { return };
+        assert!(on);
+    }
 }
