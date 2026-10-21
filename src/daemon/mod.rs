@@ -134,6 +134,8 @@ struct Inner {
     swept: i64,
     /// Teammates' files taken in the last hour, for the quota.
     quota: crate::files::Quota,
+    /// Sessions whose hooks say they are in a folder that is off: whether each is mid-turn, and when it last said.
+    off: HashMap<String, (bool, i64)>,
 }
 
 /// A session running on this machine.
@@ -197,6 +199,7 @@ impl Daemon {
                 pairs: HashMap::new(),
                 swept: 0,
                 quota: Default::default(),
+                off: HashMap::new(),
             }),
             arrived: Notify::new(),
             git_cache: Mutex::new(HashMap::new()),
@@ -303,7 +306,7 @@ impl Daemon {
                 Value::Null
             }
             Request::Hook(h) => json!(self.hook(h).await?),
-            Request::Attach { agent, cwd } => json!(self.attach(&agent, &cwd)),
+            Request::Attach { agent, cwd } => json!(self.attach(&agent, &cwd)?),
             Request::CreateTeam { name, person, relay, proof } => {
                 json!(self.create_team(&name, &person, relay, proof).await?)
             }

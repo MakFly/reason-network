@@ -1,7 +1,7 @@
 use crate::{paths, util};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -28,7 +28,7 @@ pub struct Config {
 }
 
 /// What an agent's tools say in a folder whose sessions are off the network.
-pub const OFF_HERE: &str = "Reason Network is off in this folder";
+pub const OFF_HERE: &str = "Your user turned Reason Network off for this folder";
 
 /// What happens to messages from teammates' agents: `accept` delivers them, `hold` waits for you to approve
 /// (`reason-network held`), `refuse` bounces them.
@@ -140,7 +140,7 @@ fn folder_rule<'a>(folders: &'a BTreeMap<String, String>, home: &str, cwd: &str)
     folders
         .iter()
         .filter(|(k, v)| rule_holds(k, v, home))
-        .map(|(k, v)| (k, v, parts(k, home)))
+        .map(|(k, v)| (k, v, entry_parts(k, home)))
         .filter(|(_, _, p)| at.starts_with(p))
         .max_by_key(|(_, _, p)| p.len())
         .map(|(k, v, _)| (k.as_str(), v.as_str()))
@@ -165,14 +165,28 @@ fn full(path: &str) -> bool {
         || (b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\'))
 }
 
-/// A path's folder names, `~` expanded, either slash; without case where the file system ignores it.
+/// A path's folder names, `~` expanded, either slash, `..` taken back; without case where the file system ignores it.
 fn parts(path: &str, home: &str) -> Vec<String> {
     let path = expand(path, home);
     let path = path.strip_prefix(r"\\?\").unwrap_or(&path);
-    path.split(['/', '\\'])
-        .filter(|p| !p.is_empty() && *p != ".")
-        .map(|p| if cfg!(any(windows, target_os = "macos")) { p.to_lowercase() } else { p.to_string() })
-        .collect()
+    let mut out: Vec<String> = Vec::new();
+    for p in path.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".") {
+        if p == ".." {
+            out.pop();
+        } else {
+            out.push(if cfg!(any(windows, target_os = "macos")) { p.to_lowercase() } else { p.to_string() });
+        }
+    }
+    out
+}
+
+/// An entry's folder names, as the folder really is: a link in it followed (`~/personal` → a synced folder).
+fn entry_parts(folder: &str, home: &str) -> Vec<String> {
+    let path = expand(folder, home);
+    if !full(&path) {
+        return parts(&path, home);
+    }
+    parts(&real(Path::new(&path)).display().to_string(), home)
 }
 
 /// Sets `folder`'s entry in the config file, keeping the rest of the file as it is: `off`, or none (`on`). Returns the
@@ -193,7 +207,7 @@ pub fn set_folder(folder: &str, off: bool) -> Result<(String, bool)> {
         table.as_table_like_mut().ok_or_else(|| anyhow!("fix {} first: `folders` is a table", file.display()))?;
     // The same folder, however it was written.
     let same: Vec<String> =
-        table.iter().map(|(k, _)| k.to_string()).filter(|k| parts(k, &home) == parts(&name, &home)).collect();
+        table.iter().map(|(k, _)| k.to_string()).filter(|k| entry_parts(k, &home) == parts(&name, &home)).collect();
     let was_off = same.iter().any(|k| table.get(k).and_then(|v| v.as_str()) == Some("off"));
     for k in &same {
         table.remove(k);
@@ -212,10 +226,11 @@ pub fn set_folder(folder: &str, off: bool) -> Result<(String, bool)> {
 }
 
 /// `path` as agents report their folder, links followed (on macOS, /tmp is /private/tmp), even before it exists.
-fn real(path: &std::path::Path) -> std::path::PathBuf {
+fn real(path: &Path) -> std::path::PathBuf {
     let mut rest = Vec::new();
     let mut at = path;
-    loop {
+    // A root alone has nothing to follow (and on Windows `/` would come back as `C:\`).
+    while at.parent().is_some() {
         if let Ok(r) = at.canonicalize() {
             return rest.iter().rev().fold(r, |p, n| p.join(n));
         }
@@ -224,9 +239,10 @@ fn real(path: &std::path::Path) -> std::path::PathBuf {
                 rest.push(n);
                 at = p;
             }
-            _ => return path.to_path_buf(),
+            _ => break,
         }
     }
+    path.to_path_buf()
 }
 
 /// The entry that keeps `folder` off when it has none of its own (`~/personal` for `~/personal/notes`).
@@ -269,8 +285,8 @@ mod tests {
         assert!(off(r"D:\scratch\x") && !off(r"D:\scratchpad") && !off(r"C:\Users\alex"));
         // `~` alone is the home folder; `~alex` is no one's.
         let f = folders(&[("~", "off"), ("~alex", "off")]);
-        assert!(folder_rule(&f, "/home/alex", "/home/alex/x").is_some());
-        assert!(folder_rule(&f, "/home/alex", "/home/bob").is_none());
+        assert!(folder_rule(&f, "/h/alex", "/h/alex/x").is_some());
+        assert!(folder_rule(&f, "/h/alex", "/h/bob").is_none());
     }
 
     #[test]
@@ -278,12 +294,45 @@ mod tests {
         let f = folders(&[("~/work", "off"), ("~/work/team", "work"), ("relative", "off")]);
         let cfg = Config { folders: f.clone(), ..Config::default() };
         // `work` (a network to come) isn't understood yet: the folder above it decides.
-        assert_eq!(folder_rule(&f, "/home/alex", "/home/alex/work/team/x"), Some(("~/work", "off")));
-        assert!(folder_rule(&f, "/home/alex", "/relative").is_none());
+        assert_eq!(folder_rule(&f, "/h/alex", "/h/alex/work/team/x"), Some(("~/work", "off")));
+        assert!(folder_rule(&f, "/h/alex", "/relative").is_none());
         assert_eq!(cfg.odd_folders().len(), 2);
         // No entries: nothing is off.
-        assert!(!Config::default().off_in("/home/alex/work"));
+        assert!(!Config::default().off_in("/h/alex/work"));
         let parsed: Config = toml::from_str("[folders]\n\"~/personal\" = \"off\"\n").unwrap();
         assert!(parsed.off_in(&format!("{}/personal/x", home())));
+    }
+
+    fn temp() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("reason-network-folders-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(d.join("real").join("personal").join("sub")).unwrap();
+        std::fs::create_dir_all(d.join("x")).unwrap();
+        d
+    }
+
+    #[test]
+    fn an_entry_written_with_dot_dot_holds_the_folder_it_names() {
+        let d = temp();
+        let entry = d.join("x").join("..").join("real").join("personal").display().to_string();
+        let cfg = Config { folders: folders(&[(&entry, "off")]), ..Config::default() };
+        assert!(cfg.off_in(&d.join("real").join("personal").join("sub").display().to_string()));
+        assert!(!cfg.off_in(&d.join("x").display().to_string()));
+        // Even before the folder exists.
+        let cfg = Config { folders: folders(&[("/h/alex/x/../personal", "off")]), ..Config::default() };
+        assert!(cfg.off_in("/h/alex/personal/notes") && !cfg.off_in("/h/alex/x"));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_entry_that_is_a_link_holds_the_folder_it_points_to() {
+        let d = temp();
+        std::os::unix::fs::symlink(d.join("real").join("personal"), d.join("link")).unwrap();
+        let cfg = Config { folders: folders(&[(&d.join("link").display().to_string(), "off")]), ..Config::default() };
+        // Sessions report the real folder, or the link.
+        assert!(cfg.off_in(&d.join("real").join("personal").join("sub").display().to_string()));
+        assert!(cfg.off_in(&d.join("link").join("sub").display().to_string()));
+        assert!(!cfg.off_in(&d.join("real").display().to_string()));
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

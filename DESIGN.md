@@ -388,6 +388,14 @@ edits): Claude Code plugin or `claude mcp add --scope user` + hooks, `~/.codex/c
 | `inbound` | accept | see above |
 | `folders` | none | folders whose sessions are never shared, e.g. `"~/personal" = "off"` (`reason-network folder <path> off`, `on` undoes it) |
 
+A session in a folder that is off (by its own folder or any other its agent names, links followed) never registers:
+its tools say its user turned Reason Network off for the folder, its hooks print nothing, and its agent sends no files
+from there. The person's own terminal isn't held to it. Agents that share one MCP process across sessions (Cursor,
+opencode, Codex's app-server) don't tell it which folder a call comes from: the session's hooks mark it off by its id,
+and while one of an agent's sessions that are off is mid-turn, that agent's calls naming no session get the same
+answer, never another session's identity. Known limit: a session of such an agent whose hooks don't run (Codex before
+`/hooks` trusts them) is judged by the MCP process's folder.
+
 ## Troubleshooting
 
 - **`reason-network doctor`** checks the daemon, the team connection (direct or relayed, per machine) and every agent.

@@ -299,12 +299,12 @@ impl ReasonNetworkMcp {
         if off_here() {
             anyhow::bail!(OFF_HERE);
         }
-        if meta_id.is_none()
-            && agent::multiplexed(agent)
-            && let Ok(Some(key)) =
-                self.link.call::<Option<String>>(Request::Attach { agent: agent.into(), cwd: agent::cwd() }).await
-        {
-            return Ok(key);
+        if meta_id.is_none() && agent::multiplexed(agent) {
+            match self.link.call::<Option<String>>(Request::Attach { agent: agent.into(), cwd: agent::cwd() }).await {
+                Ok(Some(key)) => return Ok(key),
+                Err(e) if e.to_string() == OFF_HERE => anyhow::bail!(OFF_HERE),
+                _ => {}
+            }
         }
         let id = meta_id.or_else(|| agent::env_session_id(agent));
         let key = match &id {
@@ -385,7 +385,8 @@ fn agent_files(paths: &[String]) -> Result<Vec<Attachment>> {
     let cwd = agent::cwd();
     let root = crate::git::lookup(&cwd).root.unwrap_or_else(|| cwd.clone());
     let confine =
-        crate::files::Confine::new(std::path::Path::new(&root), &crate::paths::user_home(), &crate::paths::home())?;
+        crate::files::Confine::new(std::path::Path::new(&root), &crate::paths::user_home(), &crate::paths::home())?
+            .with_folders(crate::config::Config::load_strict().unwrap_or_default());
     crate::files::read_within(paths, std::path::Path::new(&cwd), &confine)
 }
 

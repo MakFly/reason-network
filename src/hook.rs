@@ -58,16 +58,19 @@ async fn handle(
         .or_else(|| str_at("session_id"))
         .or_else(|| str_at("conversation_id"))
         .or_else(|| str_at("sessionId"))?;
-    let cwd = str_at("cwd")
-        .or_else(|| v["workspace_roots"][0].as_str().map(str::to_string))
-        .or_else(|| {
-            ["CURSOR_PROJECT_DIR", "GEMINI_CWD", "CLAUDE_PROJECT_DIR"].iter().find_map(|k| std::env::var(k).ok())
-        })
-        .or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()));
-    // A folder that is off: not a word, to the agent or the daemon.
-    if cwd.as_deref().is_some_and(|c| crate::config::Config::load_strict().unwrap_or_default().off_in(c)) {
-        return None;
-    }
+    // Every folder the agent names for the session, the one it works in first.
+    let mut dirs: Vec<String> = str_at("cwd").into_iter().collect();
+    dirs.extend(v["workspace_roots"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
+    dirs.extend(
+        ["CURSOR_PROJECT_DIR", "GEMINI_CWD", "CLAUDE_PROJECT_DIR"]
+            .iter()
+            .filter_map(|k| std::env::var(k).ok())
+            .filter(|s| !s.is_empty()),
+    );
+    let cwd = dirs.first().cloned().or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()));
+    // In a folder that is off, the agent hears nothing; the daemon only that this session is off.
+    let cfg = crate::config::Config::load_strict().unwrap_or_default();
+    let off = cwd.iter().chain(&dirs).any(|d| cfg.off_in(d));
     let ev = match (event, state.as_deref()) {
         ("session-start", _) => "start",
         ("user-prompt-submit", _) => "prompt",
@@ -79,7 +82,7 @@ async fn handle(
         ("doing", _) => "doing",
         _ => return None,
     };
-    let mail = takes_mail(agent, event);
+    let mail = !off && takes_mail(agent, event);
 
     let key = format!("{agent}:{session_id}");
     let req = Request::Hook(HookCall {
@@ -92,8 +95,12 @@ async fn handle(
         transcript: str_at("transcript_path"),
         doing,
         name: None,
+        dirs: dirs.into_iter().skip(1).collect(),
     });
     let reply: HookReply = link.call(req).await.ok()?;
+    if off {
+        return None;
+    }
     let ids = reply.ids;
     let text = match (reply.text, ev, reply.address) {
         (Some(t), ..) => t,

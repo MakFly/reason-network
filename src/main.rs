@@ -359,16 +359,22 @@ async fn main() -> Result<()> {
 /// A session driven from the command line (`reason network listen --as <id>`, or `terminal` for plain-terminal sends): kept
 /// alive like a hook-known session, so it stays reachable between commands.
 async fn cli_session(link: &std::sync::Arc<Link>, id: &str, event: &str) -> Result<HookReply> {
+    let mut cwd = agent::cwd();
+    // Folders that are off are about agent sessions, not the person at the terminal: theirs goes by no folder then.
+    if id == "terminal" && config::Config::load_strict().unwrap_or_default().off_in(&cwd) {
+        cwd = "/".into();
+    }
     let req = Request::Hook(HookCall {
         agent: "cli".into(),
         event: event.into(),
         session_id: id.into(),
-        cwd: Some(agent::cwd()),
+        cwd: Some(cwd),
         pid: None,
         mail: false,
         transcript: None,
         doing: None,
         name: Some(id.into()),
+        dirs: Vec::new(),
     });
     link.call(req).await
 }

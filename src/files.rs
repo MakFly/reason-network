@@ -39,6 +39,8 @@ const TEXT_ONLY: &str = "only text files can be sent (markdown, source code, JSO
 pub struct Confine {
     root: PathBuf,
     forbidden: Vec<PathBuf>,
+    /// For the folders the person turned Reason Network off for.
+    folders: crate::config::Config,
 }
 
 impl Confine {
@@ -56,7 +58,12 @@ impl Confine {
             vec![home.join(".config"), home.join(".ssh"), home.join(".aws"), home.join("Library"), state.to_path_buf()];
         refused.extend(["APPDATA", "LOCALAPPDATA"].iter().filter_map(std::env::var_os).map(PathBuf::from));
         let forbidden = refused.iter().map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())).collect();
-        Ok(Confine { root, forbidden })
+        Ok(Confine { root, forbidden, folders: Default::default() })
+    }
+
+    /// Nothing from the folders `cfg` turns Reason Network off for, either.
+    pub fn with_folders(self, cfg: crate::config::Config) -> Confine {
+        Confine { folders: cfg, ..self }
     }
 
     /// The real file at `path` (symlinks resolved), if it may be sent.
@@ -73,6 +80,11 @@ impl Confine {
         if hidden {
             bail!(
                 "{given} is a hidden file or in a hidden folder, which often hold secrets; send_message doesn't send those"
+            );
+        }
+        if self.folders.off_in(&real.display().to_string()) {
+            bail!(
+                "{given} is in a folder your user turned Reason Network off for; send_message doesn't send from there"
             );
         }
         if self.forbidden.iter().any(|f| real.starts_with(f)) {
@@ -634,6 +646,31 @@ mod tests {
         assert!(e.contains("credentials"), "{e}");
         // A person's own `send --file` reads anywhere.
         assert_eq!(read(&[home.join(".ssh/id_ed25519").display().to_string()], &repo).unwrap()[0].content, "key");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn an_agent_sends_nothing_from_a_folder_that_is_off() {
+        // Not in the temp folder, which on Windows is out of reach anyway (see the test above).
+        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("files-test-{}", ulid::Ulid::new()));
+        let (home, repo, state) = (d.join("home"), d.join("home").join("work"), d.join("state"));
+        std::fs::create_dir_all(repo.join("private")).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(repo.join("private").join("notes.md"), "mine").unwrap();
+        std::fs::write(repo.join("plan.md"), "plan").unwrap();
+        let private = repo.join("private").display().to_string();
+        let cfg = crate::config::Config { folders: [(private, "off".to_string())].into(), ..Default::default() };
+        let confine = Confine::new(&repo, &home, &state).unwrap().with_folders(cfg);
+        let notes = Path::new("private").join("notes.md").display().to_string();
+        let e = read_within(&[notes], &repo, &confine).unwrap_err().to_string();
+        assert!(e.contains("turned Reason Network off"), "{e}");
+        assert_eq!(read_within(&["plan.md".into()], &repo, &confine).unwrap()[0].content, "plan");
+        // Nor through a link to it.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(repo.join("private").join("notes.md"), repo.join("notes-link.md")).unwrap();
+            assert!(read_within(&["notes-link.md".into()], &repo, &confine).is_err());
+        }
         std::fs::remove_dir_all(&d).unwrap();
     }
 

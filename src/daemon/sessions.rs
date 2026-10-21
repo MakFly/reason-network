@@ -10,6 +10,8 @@ use std::{collections::HashSet, sync::Arc, time::Instant};
 const HOOK_TTL_MS: i64 = 6 * 3_600_000;
 /// A session gone this long isn't coming back: it is forgotten, with the mail it never read.
 const FORGET_MS: i64 = 24 * 3_600_000;
+/// A session in a folder that is off counts as mid-turn this long after its last prompt or tool call.
+const OFF_TURN_MS: i64 = 10 * 60_000;
 
 impl Daemon {
     /// How fast hooks let us reach an agent's session (`push_failed`: its push channel didn't work).
@@ -48,6 +50,10 @@ impl Daemon {
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
         let key = reg.key.clone();
+        // Its hooks said its folder is off (an MCP server several sessions share can't know its folder).
+        if g.off.contains_key(&key) {
+            bail!(OFF_HERE);
+        }
         if let Some(l) = g.live.get_mut(&key) {
             // Known already (e.g. from a hook, now the MCP server connects, or a reconnect).
             if conn.is_some() {
@@ -153,10 +159,29 @@ impl Daemon {
 
     /// A hook fired in an agent: keep its session alive, track busy/idle, hand back mail to inject.
     pub(super) async fn hook(self: &Arc<Self>, h: HookCall) -> Result<HookReply> {
-        let HookCall { agent, event, session_id, cwd, pid, mail, transcript, doing, name } = h;
+        let HookCall { agent, event, session_id, cwd, pid, mail, transcript, doing, name, dirs } = h;
         let (agent, event) = (agent.as_str(), event.as_str());
         let key = format!("{agent}:{session_id}");
         let now = util::now_ms();
+        // In a folder that is off, by any folder the agent names: never a session here, only noted as off.
+        if cwd.iter().chain(&dirs).any(|d| self.cfg.off_in(d)) {
+            let mut g = self.inner.lock().unwrap();
+            if let Some(l) = g.live.remove(&key) {
+                let _ = g.store.touch_session(&l.name, now);
+                self.presence_changed();
+            }
+            match event {
+                "end" => {
+                    g.off.remove(&key);
+                }
+                "doing" => {}
+                _ => {
+                    g.off.insert(key, (matches!(event, "prompt" | "tool"), now));
+                }
+            }
+            // Hooks print nothing either way; `listen --as` says why.
+            bail!(OFF_HERE);
+        }
         if event == "end" {
             let mut g = self.inner.lock().unwrap();
             if g.live.get(&key).is_some_and(|l| l.conn.is_none())
@@ -226,10 +251,16 @@ impl Daemon {
     }
 
     /// The hook-known session of `agent` that is calling a tool right now, when that is unambiguous: the only
-    /// busy one in `cwd` (the caller is mid-turn), else the only busy one at all.
-    pub(super) fn attach(&self, agent: &str, cwd: &str) -> Option<String> {
+    /// busy one in `cwd` (the caller is mid-turn), else the only busy one at all. None while a session of `agent` in a
+    /// folder that is off is mid-turn: the caller may be that one, which must never get another session's key.
+    pub(super) fn attach(&self, agent: &str, cwd: &str) -> Result<Option<String>> {
         let mut g = self.inner.lock().unwrap();
         self.prune(&mut g);
+        let now = util::now_ms();
+        let prefix = format!("{agent}:");
+        if g.off.iter().any(|(k, (busy, at))| *busy && now - at < OFF_TURN_MS && k.starts_with(&prefix)) {
+            bail!(OFF_HERE);
+        }
         let busy: Vec<(&String, &Live)> = g
             .live
             .iter()
@@ -238,11 +269,11 @@ impl Daemon {
             })
             .collect();
         let here: Vec<&(&String, &Live)> = busy.iter().filter(|(_, l)| l.reg.cwd == cwd).collect();
-        match (here.as_slice(), busy.as_slice()) {
+        Ok(match (here.as_slice(), busy.as_slice()) {
             ([(k, _)], _) => Some((*k).clone()),
             ([], [(k, _)]) => Some((*k).clone()),
             _ => None,
-        }
+        })
     }
 
     pub(super) fn drop_conn(&self, conn: u64) {
@@ -283,6 +314,7 @@ impl Daemon {
                 let _ = g.store.touch_session(&l.name, now);
             }
         }
+        g.off.retain(|_, (_, at)| now - *at <= HOOK_TTL_MS);
         // Just after a start, sessions that are still up haven't registered again: none is forgotten until each has had
         // the time a hook-only session gets to show it is there.
         if self.started.elapsed().as_millis() > HOOK_TTL_MS as u128 {
@@ -361,5 +393,46 @@ mod tests {
         let g = d.inner.lock().unwrap();
         assert_eq!(g.live.keys().collect::<Vec<_>>(), ["codex:2"]);
         assert!(g.store.session_by_key("codex:1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_session_its_hooks_put_in_a_folder_that_is_off_never_gets_a_key() {
+        let cfg = crate::config::Config {
+            folders: [("/work/private".to_string(), "off".to_string())].into(),
+            ..Default::default()
+        };
+        let d = Arc::new(super::super::test_daemon(cfg));
+        let call = |id: &str, event: &str, dirs: &[&str]| HookCall {
+            agent: "cursor".into(),
+            event: event.into(),
+            session_id: id.into(),
+            cwd: Some("/work/api".into()),
+            pid: None,
+            mail: true,
+            transcript: None,
+            doing: None,
+            name: None,
+            dirs: dirs.iter().map(|d| d.to_string()).collect(),
+        };
+        // Working in /work/api, with /work/private open too.
+        let e = d.hook(call("c1", "prompt", &["/work/private"])).await.unwrap_err();
+        assert_eq!(e.to_string(), OFF_HERE);
+        assert!(!d.inner.lock().unwrap().live.contains_key("cursor:c1"));
+        // Its MCP server (shared, in another folder) can't register it either.
+        let reg = SessionReg {
+            key: "cursor:c1".into(),
+            agent: "cursor".into(),
+            cwd: "/work/api".into(),
+            agent_session_id: None,
+            pid: None,
+            tier: Tier::Pull,
+            name: None,
+        };
+        assert_eq!(d.register_quiet(Some(1), reg, GitInfo::default()).unwrap_err().to_string(), OFF_HERE);
+        // Another session, mid-turn: while c1 is mid-turn too, a call naming no session can't be handed its key.
+        assert!(d.hook(call("c2", "prompt", &[])).await.unwrap().address.is_some());
+        assert_eq!(d.attach("cursor", "/work/api").unwrap_err().to_string(), OFF_HERE);
+        assert!(d.hook(call("c1", "stop", &["/work/private"])).await.is_err());
+        assert_eq!(d.attach("cursor", "/work/api").unwrap().as_deref(), Some("cursor:c2"));
     }
 }
