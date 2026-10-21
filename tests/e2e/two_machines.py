@@ -223,6 +223,11 @@ check("…and gets the invite line", "Join the Reason Network: https://reasonmac
 time.sleep(3)
 out = cli("alex", "team")
 check("…which every machine takes", re.search(r"alex \(verified\)\s+mini", out) is not None, out)
+# A link this machine made names it first: after leaving, it rejoins through the others on it.
+mini_link = re.search(r"(https://\S+#rn1-\S+)", run(mini, "link")[1]).group(1)
+run(mini, "leave")
+_, out = run(mini, "join", mini_link, "--proof", proof("u_alex", "alex", mini_ep), "--no-setup")
+check("a machine that left rejoins with a link it made itself", "Joined team vibes as alex on mini." in out, out)
 run(mini, "leave")
 run(mini, "stop")
 out = cli("alice", "join", link.group(1), "--as", "bob", "--no-setup")
@@ -231,12 +236,16 @@ check("joining a second team is refused while yours has others, and says how to 
 # Installed on its own and started a team by itself first: the team link still just works.
 sam = dict(env("alice"), REASON_NETWORK_HOME=os.path.join(D, "sam"), REASON_NETWORK_MACHINE="mini")
 r = subprocess.run([BIN, "init", "solo", "--as", "sam", "--no-setup"], env=sam, capture_output=True, text=True, timeout=90)
+solo_link = re.search(r"(https://\S+#rn1-\S+)", run(sam, "link")[1]).group(1)
 # (With a link as earlier builds wrote it.)
 old_link = link.group(1).replace("#rn1-", "#tincan1")
 r = subprocess.run([BIN, "join", old_link, "--as", "sam", "--no-setup"], env=sam, capture_output=True, text=True, timeout=90)
 check("a team of one is swapped for the team you join (a tincan1 link)", "Joined team vibes as sam on mini." in r.stdout, r.stdout + r.stderr)
 check("…unverified, without a proof", re.search(r"sam\s+mini", r.stdout) is not None and "sam (verified)" not in r.stdout, r.stdout)
 subprocess.run([BIN, "leave"], env=sam, capture_output=True, timeout=60)
+_, out = run(sam, "join", solo_link, "--as", "sam", "--no-setup")
+check("a link that names only this machine, which left, says to ask for a fresh one",
+      "names only this computer" in out and "fresh link" in out and "ourself" not in out, out)
 subprocess.run([BIN, "stop"], env=sam, capture_output=True)
 os.makedirs(os.path.join(D, "bob"), exist_ok=True)
 bob = dict(env("alice"), REASON_NETWORK_HOME=os.path.join(D, "bob"), REASON_NETWORK_MACHINE="nuc")

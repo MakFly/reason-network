@@ -222,9 +222,15 @@ pub struct Joined {
     pub unreachable: bool,
 }
 
-/// Joins a team: asks each machine in turn (the ticket's, or the one an invite code points at) to let us in.
+/// Joins a team: asks each machine in turn (the ticket's, or the one an invite code points at) to let us in. Never
+/// this machine, which a link it made itself names first.
 pub async fn join(endpoint: &Endpoint, peers: &[EndpointAddr], req: &JoinRequest) -> Joined {
-    let mut last = anyhow!("the invite lists no machines");
+    let peers: Vec<&EndpointAddr> = peers.iter().filter(|a| a.id != endpoint.id()).collect();
+    let mut last = if peers.is_empty() {
+        anyhow!("this link names only this computer, which can't let itself in: ask a teammate for a fresh link")
+    } else {
+        anyhow!("the invite lists no machines")
+    };
     let mut refused = Refusals::default();
     let mut unreachable = false;
     for addr in peers {
@@ -867,6 +873,25 @@ mod tests {
             r.add(&req(Some("jws"), owner_only), taken.into()).unwrap();
             assert_eq!(r.0.as_deref(), Some(same), "the same account, once known, is what it says in the end");
         }
+    }
+
+    #[tokio::test]
+    async fn a_link_naming_only_this_machine_says_so() {
+        let key = SecretKey::generate();
+        let endpoint = bind(key.clone(), Some("https://relay.example.com"), false).await.unwrap();
+        let req = JoinRequest {
+            team: String::new(),
+            secret: String::new(),
+            person: "alex".into(),
+            machine: "mini".into(),
+            proof: None,
+            owner_only: false,
+        };
+        let joined = join(&endpoint, &[EndpointAddr::new(key.public())], &req).await;
+        endpoint.close().await;
+        let e = joined.result.err().unwrap().to_string();
+        assert!(e.contains("names only this computer"), "{e}");
+        assert!(!joined.unreachable);
     }
 
     #[test]
