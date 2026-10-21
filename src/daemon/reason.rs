@@ -9,9 +9,20 @@ use super::{Daemon, log};
 use crate::{agent, git::GitInfo, proto::*, util};
 use anyhow::{Result, bail};
 use serde_json::Value;
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 const EVERY: Duration = Duration::from_secs(15);
+/// What the loop reads of each session. With only these, Reason answers "unchanged" (the CLI keeps the last page)
+/// until one of them changes, instead of sending every session's prompt and usage every 15 s.
+const FIELDS: &str = "title,repo,branch,status,finished_at,is_archived";
+/// A CLI from before `--fields` refuses it; the plain list is read for this long before trying again (the CLI
+/// updates itself).
+const PLAIN_FOR: Duration = Duration::from_secs(3600);
+static PLAIN_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 /// The relay is started again this long after it stops, doubling up to `RELAY_MAX_WAIT` while it keeps stopping.
 const RELAY_WAIT: Duration = Duration::from_secs(30);
 const RELAY_MAX_WAIT: Duration = Duration::from_secs(600);
@@ -78,12 +89,12 @@ impl Daemon {
 
     async fn reason_sync(self: &Arc<Self>) -> Result<()> {
         let Some(bin) = agent::find_bin("reason") else { return Ok(()) };
-        let out = tokio::process::Command::new(bin)
-            .args(["session", "list", "--limit", "20", "--json"])
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output();
-        let out = tokio::time::timeout(Duration::from_secs(30), out).await??;
+        let narrow = PLAIN_UNTIL.lock().unwrap().is_none_or(|until| Instant::now() >= until);
+        let mut out = list_sessions(&bin, narrow).await?;
+        if narrow && !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("--fields") {
+            *PLAIN_UNTIL.lock().unwrap() = Some(Instant::now() + PLAIN_FOR);
+            out = list_sessions(&bin, false).await?;
+        }
         if !out.status.success() {
             bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
         }
@@ -154,6 +165,16 @@ impl Daemon {
         }
         Ok(())
     }
+}
+
+async fn list_sessions(bin: &std::path::Path, narrow: bool) -> Result<std::process::Output> {
+    let mut args = vec!["session", "list", "--limit", "20", "--json"];
+    if narrow {
+        args.extend(["--fields", FIELDS]);
+    }
+    let out =
+        tokio::process::Command::new(bin).args(args).stdin(std::process::Stdio::null()).kill_on_drop(true).output();
+    Ok(tokio::time::timeout(Duration::from_secs(30), out).await??)
 }
 
 fn first_words(title: &str) -> String {
