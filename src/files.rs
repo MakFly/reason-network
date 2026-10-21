@@ -19,12 +19,13 @@ pub const MAX_FILES: usize = 10;
 /// system takes it.
 const MAX_NAME: usize = 100;
 const MAX_NAME_BYTES: usize = 200;
+const MAX_RAW_NAME_BYTES: usize = 4096;
 /// What a machine's presence lists when its engine takes files. One that doesn't would drop them.
 pub const FEATURE: &str = "files";
 /// A message's files are kept for a day once it was read, and at most a week unread (or held).
 pub const KEEP_MS: i64 = 86_400_000;
 pub const KEEP_UNREAD_MS: i64 = 7 * 86_400_000;
-/// The most this machine keeps of teammates' files (saved, and held for approval), and takes from one person in an
+/// The most this machine keeps of bodies and files (saved, and held for approval), and takes from one person in an
 /// hour. Past either, a teammate's machine is asked to retry later.
 pub const QUOTA_TOTAL: usize = 100 * 1024 * 1024;
 pub const QUOTA_SENDER_HOUR: usize = 20 * 1024 * 1024;
@@ -178,6 +179,9 @@ pub fn check(files: Vec<Attachment>) -> Result<Vec<Attachment>> {
     let mut taken = HashSet::new();
     let mut out = Vec::with_capacity(files.len());
     for f in files {
+        if f.name.len() > MAX_RAW_NAME_BYTES {
+            bail!("file name exceeds {MAX_RAW_NAME_BYTES} bytes");
+        }
         if f.content.len() > MAX_FILE {
             bail!(too_big(&f.name, f.content.len()));
         }
@@ -273,16 +277,16 @@ fn invisible(c: char) -> bool {
 /// bytes, keeping the extension.
 fn shorten(name: &str, suffix: &str) -> String {
     let (stem, ext) = split_ext(name);
-    let fits = |s: &str| {
-        let all = format!("{s}{suffix}{ext}");
-        all.chars().count() <= MAX_NAME && all.len() <= MAX_NAME_BYTES
-    };
-    let mut stem = stem.to_string();
-    let cut = !fits(&stem);
-    while !fits(&stem) && stem.pop().is_some() {}
-    if cut {
-        stem.truncate(stem.trim_end_matches(['.', ' ']).len());
+    let chars = MAX_NAME - suffix.chars().count() - ext.chars().count();
+    let bytes = MAX_NAME_BYTES - suffix.len() - ext.len();
+    let mut end = 0;
+    for (i, c) in stem.char_indices().take(chars) {
+        if i + c.len_utf8() > bytes {
+            break;
+        }
+        end = i + c.len_utf8();
     }
+    let stem = if end < stem.len() { stem[..end].trim_end_matches(['.', ' ']) } else { stem };
     format!("{stem}{suffix}{ext}")
 }
 
@@ -393,14 +397,14 @@ pub fn located(dir: &Path, files: &[Attachment]) -> Vec<Attachment> {
         .collect()
 }
 
-/// What each teammate sent in files in the last hour, against [`QUOTA_SENDER_HOUR`] and [`QUOTA_TOTAL`].
+/// What each teammate sent in bodies and files in the last hour, against [`QUOTA_SENDER_HOUR`] and [`QUOTA_TOTAL`].
 #[derive(Default)]
 pub struct Quota {
     recent: HashMap<String, VecDeque<(Instant, usize)>>,
 }
 
 impl Quota {
-    /// Takes `bytes` of files from `sender`, with `kept` bytes of teammates' files on this machine already (`from_sender`
+    /// Takes `bytes` from `sender`, with `kept` bytes of bodies and files on this machine already (`from_sender`
     /// of them that person's), or says why not (a teammate's machine retries later).
     pub fn admit(
         &mut self,
@@ -412,13 +416,13 @@ impl Quota {
     ) -> Result<(), String> {
         if kept + bytes > QUOTA_TOTAL {
             return Err(format!(
-                "it keeps {} MB of teammates' files at most and has that many now; it takes these once some are read",
+                "it keeps {} MB of messages at most and has that many now; it takes more once space is freed",
                 QUOTA_TOTAL >> 20
             ));
         }
         if from_sender + bytes > QUOTA_SENDER_KEPT {
             return Err(format!(
-                "it keeps {} MB of files from {sender} at most and has that many now; it takes these once some are read",
+                "it keeps {} MB of messages from {sender} at most and has that many now; it takes more once space is freed",
                 QUOTA_SENDER_KEPT >> 20
             ));
         }
@@ -427,7 +431,7 @@ impl Quota {
             q.pop_front();
         }
         if q.iter().map(|(_, b)| b).sum::<usize>() + bytes > QUOTA_SENDER_HOUR {
-            return Err(format!("it takes {} MB of files an hour from {sender} at most", QUOTA_SENDER_HOUR >> 20));
+            return Err(format!("it takes {} MB of messages an hour from {sender} at most", QUOTA_SENDER_HOUR >> 20));
         }
         q.push_back((now, bytes));
         Ok(())
@@ -461,6 +465,22 @@ mod tests {
         let d = std::env::temp_dir().join(format!("reason-network-files-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn raw_names_are_bounded_before_shortening() {
+        let huge = "x".repeat(3 * 1024 * 1024);
+        let e = check(vec![file(&huge, "")]).unwrap_err().to_string();
+        assert_eq!(e, format!("file name exceeds {MAX_RAW_NAME_BYTES} bytes"));
+        for c in ['x', '代', '🦀'] {
+            let name = format!("{}.md", c.to_string().repeat((MAX_RAW_NAME_BYTES - 3) / c.len_utf8()));
+            let files = check(vec![file(&name, ""), file(&name, "")]).unwrap();
+            for f in &files {
+                assert!(f.name.len() <= MAX_NAME_BYTES && f.name.chars().count() <= MAX_NAME);
+                assert!(f.name.ends_with(".md"));
+            }
+            assert!(files[1].name.ends_with("-2.md"));
+        }
     }
 
     #[test]
@@ -790,15 +810,15 @@ mod tests {
         let mb = 1 << 20;
         assert!(q.admit("bob", 15 * mb, 0, 0, t).is_ok());
         let e = q.admit("bob", 6 * mb, 15 * mb, 15 * mb, t).unwrap_err();
-        assert!(e.contains("20 MB of files an hour from bob"), "{e}");
+        assert!(e.contains("20 MB of messages an hour from bob"), "{e}");
         // Another teammate has their own hour; an hour later bob has his again.
         assert!(q.admit("alice", 6 * mb, 15 * mb, 0, t).is_ok());
         assert!(q.admit("bob", 6 * mb, 21 * mb, 15 * mb, t + Duration::from_secs(3601)).is_ok());
         let e = q.admit("carol", mb, QUOTA_TOTAL, 0, t).unwrap_err();
-        assert!(e.contains("100 MB of teammates' files at most"), "{e}");
+        assert!(e.contains("100 MB of messages at most"), "{e}");
         // Nor does one teammate keep more than 25 MB of it, however slowly sent.
         let e = q.admit("bob", 5 * mb, 21 * mb, 21 * mb, t + Duration::from_secs(7300)).unwrap_err();
-        assert!(e.contains("25 MB of files from bob at most"), "{e}");
+        assert!(e.contains("25 MB of messages from bob at most"), "{e}");
         assert!(q.admit("dave", 5 * mb, 21 * mb, 0, t + Duration::from_secs(7300)).is_ok());
     }
 

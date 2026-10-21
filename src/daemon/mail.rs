@@ -508,14 +508,14 @@ impl Daemon {
             if g.store.has(&msg.id)? {
                 return Ok(("queued".into(), "already delivered".into()));
             }
-            // Files take room here: past the quota, the sender's machine keeps the message and tries again later.
-            let bytes = files::size(&msg.files);
+            // Bodies and files take room even while held; past the quota the sender keeps the message.
+            let bytes = msg.body.len() + files::size(&msg.files);
             if bytes > 0 {
-                let (kept, from_sender) = (g.store.files_kept()?, g.store.files_kept_from(&sender)?);
+                let (kept, from_sender) = (g.store.bytes_kept()?, g.store.bytes_kept_from(&sender)?);
                 if let Err(why) = g.quota.admit(&sender, bytes, kept, from_sender, Instant::now()) {
                     return Ok((
                         "retry".into(),
-                        format!("queued: {} can't take these files now ({why}); retrying later", self.machine),
+                        format!("queued: {} can't take this message now ({why}); retrying later", self.machine),
                     ));
                 }
             }
@@ -666,6 +666,9 @@ fn approval_holds(a: &Signed<Approval>, team: &str, peer: &EndpointId, sender: &
 
 /// Validates a message from a peer and strips its metadata down to safe characters.
 fn clean(m: Message) -> Result<Message> {
+    if m.body.len() > MAX_BODY {
+        bail!("message exceeds the {} KB body limit", MAX_BODY / 1024);
+    }
     let ok = |s: &str, extra: &str| {
         !s.is_empty() && s.len() <= 120 && s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
     };
@@ -720,6 +723,29 @@ mod tests {
     use super::*;
     use iroh::SecretKey;
     use serde::Deserialize;
+
+    #[test]
+    fn incoming_bodies_fit_the_byte_limit() {
+        let mut msg = Message {
+            id: Ulid::new().to_string(),
+            from: "bob/api".into(),
+            from_agent: None,
+            from_repo: None,
+            to: "alex/web".into(),
+            via: None,
+            reply_to: None,
+            body: "é".repeat(MAX_BODY / 2),
+            wake: false,
+            notify: false,
+            sent_at: 0,
+            approval: None,
+            files: Vec::new(),
+        };
+        assert!(clean(msg.clone()).is_ok());
+        msg.body.push('x');
+        let e = clean(msg).unwrap_err().to_string();
+        assert!(e.contains("64 KB body limit"), "{e}");
+    }
 
     #[test]
     fn a_peers_message_id_is_a_ulid_as_written() {
