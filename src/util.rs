@@ -233,6 +233,41 @@ pub fn chmod(path: &Path, mode: u32) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
+#[cfg(unix)]
+pub fn load_key(path: &Path) -> anyhow::Result<iroh::SecretKey> {
+    use std::{
+        io::{ErrorKind, Read, Write},
+        os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    };
+    match File::options().write(true).create_new(true).mode(0o600).open(path) {
+        Ok(mut file) => {
+            let key = iroh::SecretKey::generate();
+            file.write_all(&key.to_bytes())?;
+            Ok(key)
+        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            // Check and read the same file, without following links or blocking on a FIFO.
+            let mut file = File::options().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+            let meta = file.metadata()?;
+            anyhow::ensure!(
+                meta.is_file() && meta.uid() == unsafe { libc::getuid() },
+                "{} is not a regular file of yours",
+                path.display()
+            );
+            if meta.mode() & 0o7777 & !0o600 != 0 {
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                eprintln!("[{}] tightened {} permissions to 0600", now_ms(), path.display());
+            }
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            let arr: [u8; 32] =
+                bytes.as_slice().try_into().map_err(|_| anyhow::anyhow!("{} is corrupt", path.display()))?;
+            Ok(iroh::SecretKey::from_bytes(&arr))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Text from a teammate as one printable line: no control characters (escape sequences, newlines), at most `max`
 /// characters.
 pub fn one_line(s: &str, max: usize) -> String {
@@ -260,6 +295,35 @@ pub fn current_exe() -> std::io::Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn existing_key_permissions_are_tightened_on_load() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("reason-network-key-{}", ulid::Ulid::new()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("machine.key");
+        let key = iroh::SecretKey::generate();
+        std::fs::write(&path, key.to_bytes()).unwrap();
+        chmod(&path, 0o644).unwrap();
+        assert_eq!(load_key(&path).unwrap().to_bytes(), key.to_bytes());
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn new_key_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("reason-network-key-{}", ulid::Ulid::new()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("machine.key");
+        let key = load_key(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), key.to_bytes());
+        assert_eq!(load_key(&path).unwrap().to_bytes(), key.to_bytes());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn slugs() {

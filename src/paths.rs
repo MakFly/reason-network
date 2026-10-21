@@ -245,14 +245,44 @@ pub fn claude_sessions() -> PathBuf {
 
 /// Only for you: mode 0700 (on Windows, the profile folder already is).
 pub fn ensure_home() -> std::io::Result<()> {
+    ensure_home_in(&home())
+}
+
+fn ensure_home_in(home: &Path) -> std::io::Result<()> {
     let mut dir = std::fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
-    dir.recursive(true).create(home())
+    dir.recursive(true).create(home)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let dir = std::fs::File::options().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(home)?;
+        let meta = dir.metadata()?;
+        if !meta.is_dir() || meta.uid() != unsafe { libc::getuid() } {
+            return Err(std::io::Error::other(format!("{} is not a directory of yours", home.display())));
+        }
+        if meta.mode() & 0o7777 & !0o700 != 0 {
+            dir.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+            eprintln!("[{}] tightened {} permissions to 0700", crate::util::now_ms(), home.display());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(unix)]
+    fn existing_home_permissions_are_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("reason-network-home-{}", ulid::Ulid::new()));
+        std::fs::create_dir(&dir).unwrap();
+        crate::util::chmod(&dir, 0o755).unwrap();
+        super::ensure_home_in(&dir).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777, 0o700);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     #[cfg(windows)]
     fn every_spelling_of_the_home_names_one_pipe() {

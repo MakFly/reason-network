@@ -162,15 +162,21 @@ struct Live {
 
 pub fn load_key() -> Result<SecretKey> {
     let path = paths::home().join("machine.key");
-    if let Ok(bytes) = std::fs::read(&path) {
-        let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| anyhow!("{} is corrupt", path.display()))?;
-        return Ok(SecretKey::from_bytes(&arr));
-    }
-    let key = SecretKey::generate();
-    std::fs::write(&path, key.to_bytes())?;
     #[cfg(unix)]
-    util::chmod(&path, 0o600)?;
-    Ok(key)
+    {
+        paths::ensure_home()?;
+        util::load_key(&path)
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(bytes) = std::fs::read(&path) {
+            let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| anyhow!("{} is corrupt", path.display()))?;
+            return Ok(SecretKey::from_bytes(&arr));
+        }
+        let key = SecretKey::generate();
+        std::fs::write(&path, key.to_bytes())?;
+        Ok(key)
+    }
 }
 
 impl Daemon {
