@@ -11,6 +11,8 @@ mod sessions;
 mod teamops;
 mod update;
 
+pub use update::{installer, latest_version};
+
 use crate::{
     config::Config,
     git::{self, GitInfo},

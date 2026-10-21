@@ -1,9 +1,10 @@
 name: release
 
 # Push a tag like v0.10.4 to build reason-network for macOS, Linux and Windows and publish a GitHub release, with the
-# install scripts a standalone install (and its updates) uses. The reason CLI pins the macOS and Linux archives' sha256.
-# Reason then replaces the macOS archives (and their .sha256) with Developer ID signed and notarized builds of the same
-# binaries, so macOS knows every release as one program. install.sh never puts an unsigned build over a signed one.
+# install scripts a standalone install (and its updates) uses, and manifest.txt: the sha256 of every file, signed with
+# the RELEASE_SIGNING_KEY secret (Ed25519). An update runs nothing from a release whose manifest doesn't verify against
+# the key pinned in src/daemon/update.rs, and release-signing.pub is that key. macOS builds are signed ad hoc, so
+# install.sh can check their code signature before it runs them.
 on:
   push:
     tags: ["v*"]
@@ -39,6 +40,8 @@ jobs:
       - if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked --target ${{ matrix.target }}
+      - if: runner.os == 'macOS'
+        run: codesign --force --sign - target/${{ matrix.target }}/release/reason-network
       - name: Package
         if: runner.os != 'Windows'
         run: |
@@ -71,6 +74,26 @@ jobs:
           path: dist
           merge-multiple: true
       - run: cp install.sh install.ps1 dist/
+      - name: Sign the release manifest
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          set -eu
+          [ -n "$RELEASE_SIGNING_KEY" ] || { echo "the RELEASE_SIGNING_KEY secret is not set"; exit 1; }
+          key="$RUNNER_TEMP/release-signing.key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key")
+          cd dist
+          {
+            echo "reason-network release manifest v1"
+            echo "version ${GITHUB_REF_NAME#v}"
+            sha256sum reason-network-*.tar.gz reason-network-*.zip install.sh install.ps1
+          } > manifest.txt
+          openssl pkeyutl -sign -rawin -inkey "$key" -in manifest.txt | base64 -w0 > manifest.txt.sig
+          # Signed with the key the updater pins, or not released at all.
+          base64 -d manifest.txt.sig > "$RUNNER_TEMP/sig.bin"
+          openssl pkeyutl -verify -rawin -pubin -inkey ../release-signing.pub -in manifest.txt -sigfile "$RUNNER_TEMP/sig.bin"
+          cat manifest.txt
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: dist/*

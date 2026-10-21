@@ -9,10 +9,11 @@
 #   curl -fsSL <this url> | sh -s -- init <team> --as <name>     install and start a team, non-interactive
 #
 # Environment: REASON_NETWORK_BIN_DIR (default ~/.local/bin), REASON_NETWORK_VERSION (a tag like v0.10.4; default latest), REASON_NETWORK_REPO,
-# REASON_NETWORK_DOWNLOAD_BASE (a mirror serving the release files), REASON_NETWORK_NO_PROMPT (never ask anything: updates).
+# REASON_NETWORK_DOWNLOAD_BASE (a mirror serving the release files), REASON_NETWORK_NO_PROMPT (never ask anything: updates),
+# REASON_NETWORK_MANIFEST (a release manifest the caller verified: updates; the archive must have the hash it lists).
 set -eu
 
-repo="${REASON_NETWORK_REPO:-reason-machines/reason-network}"
+repo="${REASON_NETWORK_REPO:-MakFly/reason-network}"
 bin_dir="${REASON_NETWORK_BIN_DIR:-$HOME/.local/bin}"
 version="${REASON_NETWORK_VERSION:-latest}"
 
@@ -61,8 +62,15 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 
 say "Downloading reason-network for $target..."
 curl -fsSL "$base/reason-network-$target.tar.gz" -o "$tmp/reason-network.tar.gz" || die "download failed ($base/reason-network-$target.tar.gz)"
-curl -fsSL "$base/reason-network-$target.tar.gz.sha256" -o "$tmp/sum" || die "checksum download failed; not installing"
-want="$(cut -d' ' -f1 < "$tmp/sum")"
+# An update brings the release manifest whose signature it checked: the archive's hash comes from there, not from a
+# file next to the archive that whoever swapped the archive could swap too.
+if [ -n "${REASON_NETWORK_MANIFEST:-}" ]; then
+  want="$(awk -v f="reason-network-$target.tar.gz" '$2 == f { print $1 }' "$REASON_NETWORK_MANIFEST")"
+  [ -n "$want" ] || die "the release manifest doesn't list reason-network-$target.tar.gz; not installing"
+else
+  curl -fsSL "$base/reason-network-$target.tar.gz.sha256" -o "$tmp/sum" || die "checksum download failed; not installing"
+  want="$(cut -d' ' -f1 < "$tmp/sum")"
+fi
 if command -v shasum >/dev/null 2>&1; then
   got="$(shasum -a 256 "$tmp/reason-network.tar.gz" | cut -d' ' -f1)"
 else

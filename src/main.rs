@@ -40,7 +40,7 @@ pub const AGENT_NAME: &str = "reason-network";
 pub const LEGACY_NAME: &str = "tincan";
 
 /// Where releases are published: a standalone install and its updates come from here.
-pub const REPO: &str = "reason-machines/reason-network";
+pub const REPO: &str = "MakFly/reason-network";
 
 /// Whether the Reason CLI installed this binary (in `~/.reason/bin`): then it sets up and updates with the CLI, and
 /// people type `reason network`.
@@ -82,21 +82,6 @@ pub fn install_lines(args: &str) -> [String; 2] {
         format!("curl -fsSL {base}/install.sh | sh -s -- {args}"),
         format!("powershell -c \"& ([scriptblock]::Create((irm {base}/install.ps1))) {args}\""),
     ]
-}
-
-/// The install script, run without questions, installing into `dir`.
-pub fn installer(dir: &std::path::Path) -> std::process::Command {
-    let base = format!("https://github.com/{REPO}/releases/latest/download");
-    let mut cmd;
-    if cfg!(windows) {
-        cmd = std::process::Command::new("powershell");
-        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &format!("irm {base}/install.ps1 | iex")]);
-    } else {
-        cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg(format!("s=\"$(curl -fsSL {base}/install.sh)\" && printf '%s\\n' \"$s\" | sh"));
-    }
-    cmd.env("REASON_NETWORK_BIN_DIR", dir).env("REASON_NETWORK_NO_PROMPT", "1");
-    cmd
 }
 
 /// The team link: Reason Network's join page, carrying the `ticket`.
@@ -674,7 +659,8 @@ async fn cli(cmd: Cmd) -> Result<()> {
             let dir = util::current_exe()?.parent().map(|d| d.to_path_buf()).unwrap_or_default();
             let exe = dir.join(format!("{AGENT_NAME}{}", std::env::consts::EXE_SUFFIX));
             let waiting = migrate::waiting(&exe);
-            if !installer(&dir).status()?.success() {
+            let latest = daemon::latest_version().await?;
+            if !daemon::installer(&dir, &latest).await?.status()?.success() {
                 bail!("upgrade failed");
             }
             if waiting {

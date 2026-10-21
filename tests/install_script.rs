@@ -18,6 +18,12 @@ fn engine(path: &Path, version: &str, team: Option<&str>) {
 
 /// Installs a release signed by `new` over one signed by `old`; returns whether it succeeded and the version left.
 fn update(name: &str, old: Option<&str>, new: Option<&str>, valid: bool) -> (bool, String) {
+    install(name, old, new, valid, None)
+}
+
+/// The same, as an update does it: with a verified release manifest that lists the archive's true hash (`Some(true)`)
+/// or another one (`Some(false)`), while the `.sha256` next to the archive always matches it.
+fn install(name: &str, old: Option<&str>, new: Option<&str>, valid: bool, manifest: Option<bool>) -> (bool, String) {
     let root = std::env::temp_dir().join(format!("rn-install-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let (fake, release, bin) = (root.join("fake"), root.join("release"), root.join("bin"));
@@ -57,7 +63,15 @@ esac"#,
     assert!(Command::new("sh").arg("-c").arg(pack).current_dir(&release).status().unwrap().success());
 
     let path = format!("{}:{}", fake.display(), std::env::var("PATH").unwrap());
-    let out = Command::new("sh")
+    let mut cmd = Command::new("sh");
+    if let Some(true_hash) = manifest {
+        let sum = fs::read_to_string(release.join(format!("{archive}.sha256"))).unwrap();
+        let sum = if true_hash { sum.split(' ').next().unwrap().to_string() } else { "0".repeat(64) };
+        let listed = root.join("manifest.txt");
+        fs::write(&listed, format!("reason-network release manifest v1\nversion 1.0.1\n{sum}  {archive}\n")).unwrap();
+        cmd.env("REASON_NETWORK_MANIFEST", listed);
+    }
+    let out = cmd
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
         .env("PATH", path)
         .env("HOME", &root)
@@ -90,4 +104,13 @@ fn an_unsigned_install_takes_any_build() {
 fn an_invalid_signature_never_executes() {
     assert_eq!(update("invalid-signed", Some("TEAM1"), Some("TEAM1"), false), (false, "reason-network 1.0.0".into()));
     assert_eq!(update("invalid-unsigned", None, None, false), (false, "reason-network 1.0.0".into()));
+}
+
+#[test]
+fn an_update_takes_the_archive_hash_from_the_verified_manifest() {
+    let ok = install("manifest-ok", None, None, true, Some(true));
+    assert_eq!(ok, (true, "reason-network 1.0.1".into()));
+    // The checksum file next to the archive matches it, as a swapped one would: the manifest still says no.
+    let swapped = install("manifest-mismatch", None, None, true, Some(false));
+    assert_eq!(swapped, (false, "reason-network 1.0.0".into()));
 }

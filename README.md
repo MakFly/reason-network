@@ -9,7 +9,8 @@ Every agent session on every teammate's computer shows up in one directory (who,
 what it is doing right now), and any session can message the right one directly.
 
 > This is a fork of [reason-machines/reason-network](https://github.com/reason-machines/reason-network), kept in sync
-> with upstream `main`. Prebuilt releases, the hosted sign-in and the default relay still come from Reason Machines.
+> with upstream `main`. The `reasonmachines.com` installer, the hosted sign-in and the default relay come from Reason
+> Machines; this fork's own builds install and update from [its releases](https://github.com/MakFly/reason-network/releases).
 
 ## Contents
 
@@ -79,9 +80,14 @@ cargo build --release
 ./target/release/reason-network join '<link>' --as <you>    # or join one
 ```
 
-A binary run from a `target/` directory never updates itself. If you copy it elsewhere (or use `cargo install`), set
-`auto_update = false` in `~/.reason/network/config.toml` or export `REASON_NETWORK_NO_UPDATE=1`: otherwise the daemon
-replaces it with the latest upstream release within a few hours.
+A binary run from a `target/` directory never updates itself. Copied elsewhere (or installed with `cargo install`), it
+updates from this fork's releases; turn that off with `auto_update = false` in `~/.reason/network/config.toml` or
+`REASON_NETWORK_NO_UPDATE=1`.
+
+Updates are signed: every release ships `manifest.txt`, the SHA-256 of each of its files, signed with an Ed25519 key
+whose public half is pinned in the binary (`release-signing.pub`). The updater runs nothing from a release whose
+manifest doesn't verify, and the install script it runs and the archive that script installs must both have the hash
+the manifest lists. The very first install (`curl | sh`) trusts HTTPS to GitHub, as any such installer does.
 
 ## Features
 

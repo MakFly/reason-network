@@ -7,13 +7,14 @@
 #
 # From cmd or another shell, wrap it: powershell -c "<the line>".
 # Environment: REASON_NETWORK_BIN_DIR (default ~\.local\bin), REASON_NETWORK_VERSION (default latest), REASON_NETWORK_REPO,
-# REASON_NETWORK_DOWNLOAD_BASE (a mirror serving the release files), REASON_NETWORK_NO_PROMPT (never ask anything: updates).
+# REASON_NETWORK_DOWNLOAD_BASE (a mirror serving the release files), REASON_NETWORK_NO_PROMPT (never ask anything: updates),
+# REASON_NETWORK_MANIFEST (a release manifest the caller verified: updates; the archive must have the hash it lists).
 & {
   $ErrorActionPreference = 'Stop'
   $ProgressPreference = 'SilentlyContinue'
   function die($msg) { throw "reason-network install: $msg" }
 
-  $repo = if ($env:REASON_NETWORK_REPO) { $env:REASON_NETWORK_REPO } else { 'reason-machines/reason-network' }
+  $repo = if ($env:REASON_NETWORK_REPO) { $env:REASON_NETWORK_REPO } else { 'MakFly/reason-network' }
   $bin = if ($env:REASON_NETWORK_BIN_DIR) { $env:REASON_NETWORK_BIN_DIR } else { Join-Path $HOME '.local\bin' }
   $version = if ($env:REASON_NETWORK_VERSION) { $env:REASON_NETWORK_VERSION } else { 'latest' }
 
@@ -32,8 +33,15 @@
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     $zip = Join-Path $tmp 'reason-network.zip'
     try { Invoke-WebRequest -UseBasicParsing "$base/reason-network-$target.zip" -OutFile $zip } catch { die "download failed ($base/reason-network-$target.zip)" }
-    try { Invoke-WebRequest -UseBasicParsing "$base/reason-network-$target.zip.sha256" -OutFile "$zip.sha256" } catch { die 'checksum download failed; not installing' }
-    $want = ([IO.File]::ReadAllText("$zip.sha256") -split '\s+')[0].ToLower()
+    # An update brings the release manifest whose signature it checked: the archive's hash comes from there.
+    if ($env:REASON_NETWORK_MANIFEST) {
+      $line = Get-Content $env:REASON_NETWORK_MANIFEST | Where-Object { ($_ -split '  ')[1] -eq "reason-network-$target.zip" } | Select-Object -First 1
+      if (-not $line) { die "the release manifest doesn't list reason-network-$target.zip; not installing" }
+      $want = ($line -split '  ')[0].ToLower()
+    } else {
+      try { Invoke-WebRequest -UseBasicParsing "$base/reason-network-$target.zip.sha256" -OutFile "$zip.sha256" } catch { die 'checksum download failed; not installing' }
+      $want = ([IO.File]::ReadAllText("$zip.sha256") -split '\s+')[0].ToLower()
+    }
     $file = [IO.File]::OpenRead($zip)
     try { $got = -join ([Security.Cryptography.SHA256]::Create().ComputeHash($file) | ForEach-Object { $_.ToString('x2') }) } finally { $file.Dispose() }
     if (-not $want -or $want -ne $got) { die 'checksum mismatch; not installing' }
