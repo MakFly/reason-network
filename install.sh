@@ -5,8 +5,8 @@
 #
 #   curl -fsSL <this url> | sh                      install, then set up
 #   curl -fsSL <this url> | sh -s -- <team link>    install, then join that team
-#   curl -fsSL <this url> | sh -s -- <team link> --as <name>     the same, without questions (for agents)
-#   curl -fsSL <this url> | sh -s -- init <team> --as <name>     install and start a team, without questions
+#   curl -fsSL <this url> | sh -s -- <team link> --as <name>     the same, non-interactive
+#   curl -fsSL <this url> | sh -s -- init <team> --as <name>     install and start a team, non-interactive
 #
 # Environment: REASON_NETWORK_BIN_DIR (default ~/.local/bin), REASON_NETWORK_VERSION (a tag like v0.10.4; default latest), REASON_NETWORK_REPO,
 # REASON_NETWORK_DOWNLOAD_BASE (a mirror serving the release files), REASON_NETWORK_NO_PROMPT (never ask anything: updates).

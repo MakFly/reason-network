@@ -2,8 +2,8 @@
 #
 #   irm <this url> | iex                                                  install, then set up (start or join a team)
 #   & ([scriptblock]::Create((irm <this url>))) <team link>               install, then join that team
-#   & ([scriptblock]::Create((irm <this url>))) <team link> --as <name>   the same, without questions (for agents)
-#   & ([scriptblock]::Create((irm <this url>))) init <team> --as <name>   install and start a team, without questions
+#   & ([scriptblock]::Create((irm <this url>))) <team link> --as <name>   the same, non-interactive
+#   & ([scriptblock]::Create((irm <this url>))) init <team> --as <name>   install and start a team, non-interactive
 #
 # From cmd or another shell, wrap it: powershell -c "<the line>".
 # Environment: REASON_NETWORK_BIN_DIR (default ~\.local\bin), REASON_NETWORK_VERSION (default latest), REASON_NETWORK_REPO,
