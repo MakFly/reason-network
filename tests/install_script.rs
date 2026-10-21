@@ -1,6 +1,6 @@
 //! install.sh on macOS never replaces a reason-network signed by a developer team with a build that team didn't sign:
-//! macOS would take it for a new program and ask again whether it may reach the local network. Run with stand-ins
-//! for `uname` (a Mac) and `codesign` (which reads a `# team:` line from the file), and a local release.
+//! macOS would take it for a new program and ask again whether it may reach the local network. Rejected builds must
+//! never execute. Run with stand-ins for `uname` (a Mac) and `codesign` (which reads signature markers), and a local release.
 #![cfg(unix)]
 
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
@@ -17,7 +17,7 @@ fn engine(path: &Path, version: &str, team: Option<&str>) {
 }
 
 /// Installs a release signed by `new` over one signed by `old`; returns whether it succeeded and the version left.
-fn update(name: &str, old: Option<&str>, new: Option<&str>) -> (bool, String) {
+fn update(name: &str, old: Option<&str>, new: Option<&str>, valid: bool) -> (bool, String) {
     let root = std::env::temp_dir().join(format!("rn-install-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let (fake, release, bin) = (root.join("fake"), root.join("release"), root.join("bin"));
@@ -27,10 +27,28 @@ fn update(name: &str, old: Option<&str>, new: Option<&str>) -> (bool, String) {
     script(&fake.join("uname"), r#"case "$1" in -s) echo Darwin ;; -m) echo arm64 ;; esac"#);
     script(
         &fake.join("codesign"),
-        r#"for f; do :; done; t="$(sed -n 's/^# team: //p' "$f")"; echo "TeamIdentifier=${t:-not set}" >&2"#,
+        r#"case "$1" in
+  --verify)
+    [ "$2" = --strict ] || exit 1
+    ! grep -q '^# invalid signature$' "$3"
+    ;;
+  -dv)
+    t="$(sed -n 's/^# team: //p' "$2")"
+    echo "TeamIdentifier=${t:-not set}" >&2
+    ;;
+  *) exit 1 ;;
+esac"#,
     );
     engine(&bin.join("reason-network"), "1.0.0", old);
     engine(&release.join("reason-network"), "1.0.1", new);
+    let candidate = release.join("reason-network");
+    let mut body = fs::read_to_string(&candidate).unwrap();
+    if !valid {
+        body.push_str("# invalid signature\n");
+    }
+    body.push_str("touch \"$REASON_NETWORK_TEST_MARKER\"\n");
+    fs::write(&candidate, body).unwrap();
+    let marker = root.join("executed");
     let archive = "reason-network-aarch64-apple-darwin.tar.gz";
     let pack = format!(
         "tar -czf {archive} reason-network && rm reason-network && \
@@ -46,22 +64,30 @@ fn update(name: &str, old: Option<&str>, new: Option<&str>) -> (bool, String) {
         .env("REASON_NETWORK_BIN_DIR", &bin)
         .env("REASON_NETWORK_DOWNLOAD_BASE", format!("file://{}", release.display()))
         .env("REASON_NETWORK_NO_PROMPT", "1")
+        .env("REASON_NETWORK_TEST_MARKER", &marker)
         .output()
         .unwrap();
-    let left = Command::new(bin.join("reason-network")).output().unwrap();
+    assert_eq!(marker.exists(), out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let left = Command::new(bin.join("reason-network")).env("REASON_NETWORK_TEST_MARKER", &marker).output().unwrap();
     let _ = fs::remove_dir_all(&root);
     (out.status.success(), String::from_utf8_lossy(&left.stdout).trim().to_string())
 }
 
 #[test]
 fn a_signed_install_takes_only_its_teams_builds() {
-    assert_eq!(update("same-team", Some("TEAM1"), Some("TEAM1")), (true, "reason-network 1.0.1".into()));
-    assert_eq!(update("unsigned", Some("TEAM1"), None), (false, "reason-network 1.0.0".into()));
-    assert_eq!(update("other-team", Some("TEAM1"), Some("TEAM2")), (false, "reason-network 1.0.0".into()));
+    assert_eq!(update("same-team", Some("TEAM1"), Some("TEAM1"), true), (true, "reason-network 1.0.1".into()));
+    assert_eq!(update("unsigned", Some("TEAM1"), None, true), (false, "reason-network 1.0.0".into()));
+    assert_eq!(update("other-team", Some("TEAM1"), Some("TEAM2"), true), (false, "reason-network 1.0.0".into()));
 }
 
 #[test]
 fn an_unsigned_install_takes_any_build() {
-    assert_eq!(update("was-unsigned", None, None), (true, "reason-network 1.0.1".into()));
-    assert_eq!(update("now-signed", None, Some("TEAM1")), (true, "reason-network 1.0.1".into()));
+    assert_eq!(update("was-unsigned", None, None, true), (true, "reason-network 1.0.1".into()));
+    assert_eq!(update("now-signed", None, Some("TEAM1"), true), (true, "reason-network 1.0.1".into()));
+}
+
+#[test]
+fn an_invalid_signature_never_executes() {
+    assert_eq!(update("invalid-signed", Some("TEAM1"), Some("TEAM1"), false), (false, "reason-network 1.0.0".into()));
+    assert_eq!(update("invalid-unsigned", None, None, false), (false, "reason-network 1.0.0".into()));
 }
