@@ -83,9 +83,7 @@ impl Confine {
             );
         }
         if self.folders.off_in(&real.display().to_string()) {
-            bail!(
-                "{given} is in a folder your user turned Reason Network off for; send_message doesn't send from there"
-            );
+            return Err(in_off_folder(given));
         }
         if self.forbidden.iter().any(|f| real.starts_with(f)) {
             bail!(
@@ -96,17 +94,31 @@ impl Confine {
     }
 }
 
+fn in_off_folder(given: &str) -> anyhow::Error {
+    anyhow!("{given} is in a folder your user turned Reason Network off for; files aren't sent from there")
+}
+
 /// Reads the files at `paths` (relative ones from `cwd`) for a message: anywhere, for a person's own `send --file`.
 pub fn read(paths: &[String], cwd: &Path) -> Result<Vec<Attachment>> {
-    read_from(paths, cwd, None)
+    read_from(paths, cwd, None, None)
+}
+
+/// The same, but none from a folder `folders` turns Reason Network off for: for `send --file` from an agent's shell.
+pub fn read_outside(paths: &[String], cwd: &Path, folders: &crate::config::Config) -> Result<Vec<Attachment>> {
+    read_from(paths, cwd, None, Some(folders))
 }
 
 /// The same, only from where `confine` allows: for an agent's `send_message`.
 pub fn read_within(paths: &[String], cwd: &Path, confine: &Confine) -> Result<Vec<Attachment>> {
-    read_from(paths, cwd, Some(confine))
+    read_from(paths, cwd, Some(confine), None)
 }
 
-fn read_from(paths: &[String], cwd: &Path, confine: Option<&Confine>) -> Result<Vec<Attachment>> {
+fn read_from(
+    paths: &[String],
+    cwd: &Path,
+    confine: Option<&Confine>,
+    folders: Option<&crate::config::Config>,
+) -> Result<Vec<Attachment>> {
     if paths.len() > MAX_FILES {
         bail!(too_many(paths.len()));
     }
@@ -115,6 +127,13 @@ fn read_from(paths: &[String], cwd: &Path, confine: Option<&Confine>) -> Result<
         let mut path = cwd.join(p);
         if let Some(c) = confine {
             path = c.allow(p, &path)?;
+        }
+        // Where the file really is (links followed), whichever folder the command runs in.
+        if let Some(cfg) = folders {
+            path = std::fs::canonicalize(&path).map_err(|_| anyhow!("can't read {p}"))?;
+            if cfg.off_in(&path.display().to_string()) {
+                return Err(in_off_folder(p));
+            }
         }
         // Asked before opening, too: Windows doesn't open a folder at all ("Access is denied"), which would hide why.
         if std::fs::metadata(&path).is_ok_and(|m| !m.is_file()) {
@@ -671,6 +690,32 @@ mod tests {
             std::os::unix::fs::symlink(repo.join("private").join("notes.md"), repo.join("notes-link.md")).unwrap();
             assert!(read_within(&["notes-link.md".into()], &repo, &confine).is_err());
         }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn an_agents_shell_sends_nothing_from_a_folder_that_is_off_wherever_it_runs() {
+        let d = temp();
+        let (private, elsewhere) = (d.join("private"), d.join("elsewhere"));
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(private.join("notes.txt"), "mine").unwrap();
+        std::fs::write(d.join("plan.md"), "plan").unwrap();
+        let cfg = crate::config::Config {
+            folders: [(private.display().to_string(), "off".to_string())].into(),
+            ..Default::default()
+        };
+        // By its full path, from another folder, or by a path relative to that one.
+        let full = private.join("notes.txt").display().to_string();
+        let relative = Path::new("..").join("private").join("notes.txt").display().to_string();
+        for p in [full.clone(), relative] {
+            let e = read_outside(std::slice::from_ref(&p), &elsewhere, &cfg).unwrap_err().to_string();
+            assert!(e.contains("turned Reason Network off"), "{p}: {e}");
+        }
+        let plan = d.join("plan.md").display().to_string();
+        assert_eq!(read_outside(&[plan], &elsewhere, &cfg).unwrap()[0].content, "plan");
+        // A person's own `send --file` reads anywhere.
+        assert_eq!(read(&[full], &elsewhere).unwrap()[0].content, "mine");
         std::fs::remove_dir_all(&d).unwrap();
     }
 

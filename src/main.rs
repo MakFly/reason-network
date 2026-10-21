@@ -434,7 +434,13 @@ async fn cli(cmd: Cmd) -> Result<()> {
             if body.trim().is_empty() {
                 bail!("empty message");
             }
-            let files = files::read(&files, &std::env::current_dir()?)?;
+            let cwd = std::env::current_dir()?;
+            // An agent's shell sends no file from a folder that is off, wherever it runs.
+            let files = if agent_shell() {
+                files::read_outside(&files, &cwd, &config::Config::load_strict().unwrap_or_default())?
+            } else {
+                files::read(&files, &cwd)?
+            };
             // Messages come from agent sessions: `--from`'s, this agent's, or from a plain terminal, `<you>/terminal`.
             // An agent shell Reason Network doesn't know (its tools aren't loaded) counts as a terminal.
             let send = |from: String| Request::Send {
