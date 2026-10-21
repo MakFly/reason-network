@@ -9,6 +9,7 @@ use crate::{
     git::GitInfo,
     net::{Presence, Remote},
     proto::*,
+    store::Remembered,
     util,
 };
 use anyhow::{Result, bail};
@@ -52,7 +53,7 @@ enum Place {
 impl Daemon {
     /// This machine's sessions: running ones, plus (if `unmanaged`) Claude Code sessions without Reason Network.
     pub(super) async fn local_rows(self: &Arc<Self>, me: Option<&str>, unmanaged: bool) -> Result<Vec<SessionInfo>> {
-        let claude = tokio::task::spawn_blocking(claude::scan).await?;
+        let claude = self.shared(tokio::task::spawn_blocking(claude::scan).await?);
         let mut cwds: Vec<String> = self.inner.lock().unwrap().live.values().map(|l| l.reg.cwd.clone()).collect();
         cwds.extend(claude.iter().filter_map(|c| c.cwd.clone()));
         let mut gits: HashMap<String, GitInfo> = HashMap::new();
@@ -188,9 +189,27 @@ impl Daemon {
         }
     }
 
+    /// Claude Code sessions outside the folders that are off.
+    fn shared(&self, mut claude: Vec<ClaudeSession>) -> Vec<ClaudeSession> {
+        claude.retain(|c| !c.cwd.as_deref().is_some_and(|d| self.cfg.off_in(d)));
+        claude
+    }
+
+    /// Sessions this machine remembers (gone for now), but none from a folder that is off.
+    fn remembered(&self, g: &super::Inner) -> Vec<Remembered> {
+        let live: HashSet<&str> = g.live.values().map(|l| l.name.as_str()).collect();
+        let mut known = g.store.sessions().unwrap_or_default();
+        known.retain(|r| !live.contains(r.name.as_str()) && !self.cfg.off_in(&r.cwd));
+        known
+    }
+
     /// What this machine tells teammates about itself.
     pub async fn presence(self: &Arc<Self>) -> Presence {
-        let mut sessions = self.local_rows(None, self.cfg.share_unmanaged).await.unwrap_or_default();
+        let sessions = self.local_rows(None, self.cfg.share_unmanaged).await.unwrap_or_default();
+        self.presence_of(sessions)
+    }
+
+    fn presence_of(&self, mut sessions: Vec<SessionInfo>) -> Presence {
         if !self.cfg.share_paths {
             for s in &mut sessions {
                 s.cwd =
@@ -198,9 +217,7 @@ impl Daemon {
             }
         }
         let g = self.inner.lock().unwrap();
-        let live: HashSet<&str> = g.live.values().map(|l| l.name.as_str()).collect();
-        let mut known = g.store.sessions().unwrap_or_default();
-        known.retain(|r| !live.contains(r.name.as_str()));
+        let mut known = self.remembered(&g);
         known.sort_by_key(|r| -r.last_seen);
         Presence {
             sessions,
@@ -218,8 +235,7 @@ impl Daemon {
         let mut rows = self.local_rows(me.as_deref(), true).await?;
         if all {
             let g = self.inner.lock().unwrap();
-            let live: HashSet<&str> = g.live.values().map(|l| l.name.as_str()).collect();
-            for r in g.store.sessions()?.into_iter().filter(|r| !live.contains(r.name.as_str())) {
+            for r in self.remembered(&g) {
                 let git = GitInfo { root: None, repo: r.repo.clone(), branch: r.branch.clone() };
                 let mut row = self.row(&r.name, &r.agent, &r.cwd, Some(&git));
                 row.status = "offline".into();
@@ -284,7 +300,6 @@ impl Daemon {
     /// Every address target we know about, here and on teammates' machines.
     fn candidates(&self, g: &super::Inner, remotes: &HashMap<EndpointId, Remote>) -> Vec<Cand> {
         let mut out = Vec::new();
-        let live: HashSet<&str> = g.live.values().map(|l| l.name.as_str()).collect();
         for l in g.live.values() {
             out.push(Cand {
                 person: self.person.clone(),
@@ -295,7 +310,7 @@ impl Daemon {
                 place: Place::Local(Some(l.reg.key.clone())),
             });
         }
-        for r in g.store.sessions().unwrap_or_default().into_iter().filter(|r| !live.contains(r.name.as_str())) {
+        for r in self.remembered(g) {
             out.push(Cand {
                 person: self.person.clone(),
                 name: r.name,
@@ -434,4 +449,45 @@ impl Daemon {
 
 fn claude_match(c: &ClaudeSession, reg: &SessionReg) -> bool {
     (reg.agent_session_id.is_some() && c.session_id == reg.agent_session_id) || reg.pid == Some(c.pid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presence_leaves_out_sessions_in_a_folder_that_is_off() {
+        let cfg = crate::config::Config {
+            folders: [("/work/private".to_string(), "off".to_string())].into(),
+            share_unmanaged: true,
+            ..Default::default()
+        };
+        let d = super::super::test_daemon(cfg);
+        // Remembered from before the folder was off, and one that wasn't in it.
+        for (name, cwd) in [("taxes-claude", "/work/private/taxes"), ("api-claude", "/work/api")] {
+            let r = Remembered {
+                name: name.into(),
+                key: format!("claude-code:{name}"),
+                agent: agent::CLAUDE_CODE.into(),
+                cwd: cwd.into(),
+                repo: None,
+                branch: None,
+                doing: None,
+                tier: Tier::Push,
+                last_seen: util::now_ms(),
+            };
+            d.inner.lock().unwrap().store.upsert_session(&r).unwrap();
+        }
+        assert_eq!(d.presence_of(Vec::new()).known, ["api-claude"]);
+        // Claude Code's own list: neither registered nor shown without Reason Network.
+        let claude = |pid: u32, cwd: &str| -> ClaudeSession {
+            serde_json::from_value(serde_json::json!({ "pid": pid, "cwd": cwd })).unwrap()
+        };
+        let shown = d.shared(vec![claude(1, "/work/private"), claude(2, "/work/api"), claude(3, "/work/private/x")]);
+        assert_eq!(shown.iter().map(|c| c.pid).collect::<Vec<_>>(), [2]);
+        // Nor can a message reach the remembered one.
+        let g = d.inner.lock().unwrap();
+        let names: Vec<String> = d.candidates(&g, &HashMap::new()).into_iter().map(|c| c.name).collect();
+        assert_eq!(names, ["api-claude"]);
+    }
 }

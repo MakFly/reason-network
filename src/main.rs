@@ -234,6 +234,12 @@ enum Cmd {
     },
     /// Use your own iroh relay for the team, so its machines never contact n0 (or `default` for Reason's relays)
     Relay { url: String },
+    /// Keep the agent sessions in a folder (and the folders in it) off the network, or put them back on
+    Folder {
+        path: String,
+        #[arg(value_parser = ["off", "on"])]
+        state: String,
+    },
     /// List messages waiting for your approval (when `inbound` is `hold`)
     Held,
     /// Deliver held messages
@@ -589,6 +595,23 @@ async fn cli(cmd: Cmd) -> Result<()> {
             let url = (url != "default").then_some(url);
             println!("{}", shown(&link.call::<String>(Request::SetRelay { url }).await?));
             wait_exit(daemon_pid()).await;
+        }
+        Cmd::Folder { path, state } => {
+            let off = state == "off";
+            let (name, changed) = config::set_folder(&path, off)?;
+            // The daemon reads the config when it starts.
+            if changed && stop_daemon().await {
+                let _ = Link::new(None).call::<TeamInfo>(Request::Team).await;
+            }
+            if off {
+                println!(
+                    "Reason Network is off in {name}: teammates don't see its sessions and can't message them. `{CLI} folder {name} on` undoes it."
+                );
+            } else if let Some(by) = config::off_by(&name) {
+                println!("{name} is still off: it is in {by}.");
+            } else {
+                println!("Reason Network is on in {name}.");
+            }
         }
         Cmd::Held => {
             let msgs: Vec<Message> = link.call(Request::Held).await?;

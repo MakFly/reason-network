@@ -92,7 +92,13 @@ impl Link {
         let c = self.spawn_io(connect_or_start(self.start).await?);
         let regs: Vec<SessionReg> = self.regs.lock().unwrap().values().cloned().collect();
         for reg in regs {
-            self.raw(&c, &Request::Register { session: reg }).await?;
+            if let Err(e) = self.raw(&c, &Request::Register { session: reg.clone() }).await {
+                // Its folder was turned off meanwhile: it stays off, and the rest reconnect.
+                if e.to_string() != crate::config::OFF_HERE {
+                    return Err(e);
+                }
+                self.regs.lock().unwrap().remove(&reg.key);
+            }
         }
         *slot = Some(c.clone());
         Ok(c)

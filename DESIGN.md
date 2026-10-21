@@ -386,6 +386,7 @@ edits): Claude Code plugin or `claude mcp add --scope user` + hooks, `~/.codex/c
 | `auto_update` | `true` | install new releases when they come out (checked every few hours) |
 | `reason` | `false` | list your live Reason sessions (set by `reason-network setup`) |
 | `inbound` | accept | see above |
+| `folders` | none | folders whose sessions are never shared, e.g. `"~/personal" = "off"` (`reason-network folder <path> off`, `on` undoes it) |
 
 ## Troubleshooting
 

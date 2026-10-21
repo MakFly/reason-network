@@ -298,8 +298,19 @@ run(eve, "stop")
 out = cli("alice", "team")
 check("the others are still connected", re.search(r"alex \(verified\)\s+laptop\s+(direct|relay)", out) is not None, out)
 
+# --- a folder that is off: its sessions are never shared ---
+PRIVATE = os.path.join(D, "private")
+os.makedirs(PRIVATE, exist_ok=True)
+out = cli("alex", "folder", PRIVATE, "off")
+check("folder <path> off turns Reason Network off there", "Reason Network is off in" in out and "private on` undoes it" in out, out)
+check("…in the config's [folders]", re.search(r'\[folders\]\n".*private" = "off"', open(os.path.join(H["alex"], "config.toml")).read()) is not None)
+out = cli("alex", "folder", os.path.join(PRIVATE, "sub"), "on")
+check("…and a folder in it stays off", "sub is still off: it is in" in out, out)
+time.sleep(3)
+
 # --- sessions on both machines ---
 claude = Mcp("alex", "claude-code", strip_claude=False, cwd=ROOT)
+hidden = Mcp("alex", "claude-code", strip_claude=True, cwd=PRIVATE)
 codex = Mcp("alice", "codex-mcp-client", strip_claude=True, cwd=os.path.join(D, "work"))
 meta = {"sessionId": "11111111-aaaa", "threadId": "11111111-aaaa"}
 time.sleep(7)  # Claude's session registers after 3s; presence propagates every 2s
@@ -307,6 +318,16 @@ out = codex.tool("list_team", {}, meta)
 claude_name = os.path.basename(ROOT).lower() + "-claude"
 check("alice's agent sees alex's session across machines", claude_name in out and "alex (verified) · laptop" in out, out)
 check("list_team gives the invite line", "Invite people with this line: Join the Reason Network: https://reasonmachines.com/network/join/#rn1-" in out, out)
+check("…but not the one in alex's folder that is off", "private-claude" not in out, out)
+out = hidden.tool("list_team", {})
+check("in a folder that is off, the tools say so", out == "Reason Network is off in this folder", out)
+out = hook("alex", "codex", "session-start", {"session_id": "33333333-cccc", "cwd": PRIVATE, "hook_event_name": "SessionStart"})
+check("…and hooks say nothing", out == "", out)
+out = cli("alex", "who")
+check("…nor is either session on alex's own list", "private-" not in out and claude_name in out, out)
+out = cli("alice", "send", "alex/private-claude", "x")
+check("…and a teammate can't message it", "no session called 'alex/private-claude'" in out, out)
+hidden.close()
 # (After Codex's first tool call registered it.) Nobody reports a status: Reason Network reads the plan step in progress from Codex's own transcript.
 rollout = os.path.join(D, "rollout.jsonl")
 plan = {"plan": [{"step": "set up fixtures", "status": "completed"}, {"step": "testing cross-machine Reason Network", "status": "in_progress"}]}
@@ -524,6 +545,9 @@ cli("alice", "team")  # alice's machine comes back and dials alex
 time.sleep(10)
 out = cli("alice", "team")
 check("alice's machine learns it was removed when it reconnects", "not in a team" in out, out)
+
+out = cli("alex", "folder", PRIVATE, "on")
+check("folder <path> on puts it back", "Reason Network is on in" in out and "private" not in open(os.path.join(H["alex"], "config.toml")).read(), out)
 
 claude.close()
 cli("alex", "stop")

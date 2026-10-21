@@ -3,6 +3,7 @@
 use crate::{
     agent::{self, ClaudeSocket},
     client::Link,
+    config::OFF_HERE,
     proto::*,
     render,
 };
@@ -117,6 +118,7 @@ pub async fn run() -> Result<()> {
         tokio::time::sleep(Duration::from_secs(3)).await;
         let agent = s.agent(&peer, None);
         if !agent::multiplexed(agent)
+            && !off_here()
             && let Err(e) = s.session(agent, None).await
         {
             eprintln!("reason-network: registering session: {e:#}");
@@ -294,6 +296,9 @@ impl ReasonNetworkMcp {
 
     /// Registers the session on first use and returns its key.
     async fn session(&self, agent: &'static str, meta_id: Option<String>) -> Result<String> {
+        if off_here() {
+            anyhow::bail!(OFF_HERE);
+        }
         if meta_id.is_none()
             && agent::multiplexed(agent)
             && let Ok(Some(key)) =
@@ -363,6 +368,11 @@ impl ReasonNetworkMcp {
             Err(e) => eprintln!("reason-network: delivering to Claude Code: {e}"),
         }
     }
+}
+
+/// Whether this session's folder is off the network (read each time: `folder` may have changed it since).
+fn off_here() -> bool {
+    crate::config::Config::load_strict().unwrap_or_default().off_in(&agent::cwd())
 }
 
 /// The files an agent asked to send, read only from its own folder: its repository (or where it works), none of its

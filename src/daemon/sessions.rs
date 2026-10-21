@@ -2,7 +2,7 @@
 //! kept alive by hook events and the agent's process).
 
 use super::{Daemon, Inner, Live, log};
-use crate::{agent, git::GitInfo, proto::*, render, store::Remembered, util};
+use crate::{agent, config::OFF_HERE, git::GitInfo, proto::*, render, store::Remembered, util};
 use anyhow::{Result, anyhow, bail};
 use std::{collections::HashSet, sync::Arc, time::Instant};
 
@@ -39,6 +39,10 @@ impl Daemon {
         mut reg: SessionReg,
         git: GitInfo,
     ) -> Result<(Registered, (String, Vec<Message>))> {
+        // Every session comes in here: one in a folder that is off never does.
+        if self.cfg.off_in(&reg.cwd) {
+            bail!(OFF_HERE);
+        }
         let now = util::now_ms();
         let others = self.my_names_elsewhere();
         let mut g = self.inner.lock().unwrap();
@@ -328,4 +332,34 @@ fn pick_name(g: &Inner, reg: &SessionReg, git: &GitInfo, elsewhere: &HashSet<Str
         return Ok(base);
     }
     Ok((2..).map(|i| util::joined(&base, &i.to_string())).find(|n| !taken(n)).expect("some suffix is free"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_session_in_a_folder_that_is_off_never_registers() {
+        let cfg = crate::config::Config {
+            folders: [("/work/private".to_string(), "off".to_string())].into(),
+            ..Default::default()
+        };
+        let d = super::super::test_daemon(cfg);
+        let reg = |key: &str, cwd: &str| SessionReg {
+            key: key.into(),
+            agent: "codex".into(),
+            cwd: cwd.into(),
+            agent_session_id: None,
+            pid: None,
+            tier: Tier::Pull,
+            name: None,
+        };
+        let err = d.register_quiet(None, reg("codex:1", "/work/private/notes"), GitInfo::default()).unwrap_err();
+        assert_eq!(err.to_string(), OFF_HERE);
+        let (r, _) = d.register_quiet(Some(1), reg("codex:2", "/work/private-api"), GitInfo::default()).unwrap();
+        assert_eq!(r.name, "private-api-codex");
+        let g = d.inner.lock().unwrap();
+        assert_eq!(g.live.keys().collect::<Vec<_>>(), ["codex:2"]);
+        assert!(g.store.session_by_key("codex:1").unwrap().is_none());
+    }
 }

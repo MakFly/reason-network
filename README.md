@@ -73,6 +73,7 @@ reason-network send '*' "deploying api at 5"   # everyone (or alice/*, repo:api)
 reason-network listen --as terminal                            # replies to what you sent from this terminal
 reason-network link                                            # the invite line again: Join the Reason Network: <link>
 reason-network setup                                           # which agents are on it, and how messages are handled
+reason-network folder ~/personal off                           # sessions in ~/personal stay off the network (on undoes it)
 ```
 
 With the Reason CLI, `reason network who` and `reason network send` work too, and

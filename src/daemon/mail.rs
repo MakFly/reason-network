@@ -495,7 +495,7 @@ impl Daemon {
             let mut g = self.inner.lock().unwrap();
             self.prune(&mut g);
             let key = g.live.iter().find(|(_, l)| l.name == name).map(|(k, _)| k.clone());
-            if key.is_none() && g.store.session_by_name(name)?.is_none() {
+            if key.is_none() && g.store.session_by_name(name)?.is_none_or(|r| self.cfg.off_in(&r.cwd)) {
                 return Ok(("refused".into(), format!("no session called {} on {}", msg.to, self.machine)));
             }
             if g.store.has(&msg.id)? {

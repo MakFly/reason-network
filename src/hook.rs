@@ -64,6 +64,10 @@ async fn handle(
             ["CURSOR_PROJECT_DIR", "GEMINI_CWD", "CLAUDE_PROJECT_DIR"].iter().find_map(|k| std::env::var(k).ok())
         })
         .or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()));
+    // A folder that is off: not a word, to the agent or the daemon.
+    if cwd.as_deref().is_some_and(|c| crate::config::Config::load_strict().unwrap_or_default().off_in(c)) {
+        return None;
+    }
     let ev = match (event, state.as_deref()) {
         ("session-start", _) => "start",
         ("user-prompt-submit", _) => "prompt",
