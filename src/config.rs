@@ -30,6 +30,11 @@ pub struct Config {
 /// What an agent's tools say in a folder whose sessions are off the network.
 pub const OFF_HERE: &str = "Your user turned Reason Network off for this folder";
 
+/// What a call naming no session gets, from an agent whose sessions share one MCP server, while one of them works in a
+/// folder that is off (the call may be that one's).
+pub const BUSY_OFF: &str = "Reason Network can't tell which session this call comes from while another session of this \
+                            agent works in a folder where it is off; try again in a few minutes";
+
 /// What happens to messages from teammates' agents: `accept` delivers them, `hold` waits for you to approve
 /// (`reason-network held`), `refuse` bounces them.
 #[derive(Debug, Clone, Serialize, Deserialize)]

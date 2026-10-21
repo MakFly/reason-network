@@ -325,11 +325,21 @@ out = hook("alex", "codex", "session-start", {"session_id": "33333333-cccc", "cw
 check("…and hooks say nothing", out == "", out)
 out = hook("alex", "cursor", "session-start", {"conversation_id": "c-off", "workspace_roots": [os.path.join(D, "work"), PRIVATE]})
 check("…nor for a session with that folder open beside another", out == "", out)
-r = subprocess.run([BIN, "send", "alice/work-codex", "from alex's terminal in the folder that is off"], env=env("alex"), cwd=PRIVATE,
+# A person's terminal: none of the variables agents set for their commands (this test may run in an agent's).
+AGENT_VARS = ("AI_AGENT", "CODEX_", "GEMINI_CLI", "REASON_NETWORK_AGENT", "TINCAN_AGENT", "GROK_", "CURSOR_AGENT", "OPENCODE", "COPILOT_")
+person = {k: v for k, v in env("alex").items() if not k.startswith(AGENT_VARS)}
+r = subprocess.run([BIN, "send", "alice/work-codex", "from alex's terminal in the folder that is off"], env=person, cwd=PRIVATE,
                    capture_output=True, text=True, timeout=90)
 check("the person's own terminal there still sends", "→ alice/work-codex" in r.stdout, r.stdout + r.stderr)
 out = codex.tool("check_inbox", {}, meta)
 check("…as alex/terminal", 'from="alex/terminal"' in out and "in the folder that is off" in out, out)
+with open(os.path.join(PRIVATE, "notes.txt"), "w") as f:
+    f.write("private\n")
+agent_shell = dict(person, CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="44444444-dddd", CLAUDE_PROJECT_DIR=PRIVATE)
+r = subprocess.run([BIN, "send", "alice/work-codex", "--file", "notes.txt", "from an agent's shell there"], env=agent_shell, cwd=PRIVATE,
+                   capture_output=True, text=True, timeout=90)
+check("…but an agent's shell there sends nothing, not even as the terminal", "turned Reason Network off for this folder" in r.stderr
+      and "→" not in r.stdout, r.stdout + r.stderr)
 out = cli("alex", "who")
 check("…nor is either session on alex's own list", "private-" not in out and claude_name in out, out)
 out = cli("alice", "send", "alex/private-claude", "x")

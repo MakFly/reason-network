@@ -2,7 +2,15 @@
 //! kept alive by hook events and the agent's process).
 
 use super::{Daemon, Inner, Live, log};
-use crate::{agent, config::OFF_HERE, git::GitInfo, proto::*, render, store::Remembered, util};
+use crate::{
+    agent,
+    config::{BUSY_OFF, OFF_HERE},
+    git::GitInfo,
+    proto::*,
+    render,
+    store::Remembered,
+    util,
+};
 use anyhow::{Result, anyhow, bail};
 use std::{collections::HashSet, sync::Arc, time::Instant};
 
@@ -182,6 +190,8 @@ impl Daemon {
             // Hooks print nothing either way; `listen --as` says why.
             bail!(OFF_HERE);
         }
+        // Only in folders that are on (again): it left the one that is off.
+        self.inner.lock().unwrap().off.remove(&key);
         if event == "end" {
             let mut g = self.inner.lock().unwrap();
             if g.live.get(&key).is_some_and(|l| l.conn.is_none())
@@ -259,7 +269,7 @@ impl Daemon {
         let now = util::now_ms();
         let prefix = format!("{agent}:");
         if g.off.iter().any(|(k, (busy, at))| *busy && now - at < OFF_TURN_MS && k.starts_with(&prefix)) {
-            bail!(OFF_HERE);
+            bail!(BUSY_OFF);
         }
         let busy: Vec<(&String, &Live)> = g
             .live
@@ -431,8 +441,11 @@ mod tests {
         assert_eq!(d.register_quiet(Some(1), reg, GitInfo::default()).unwrap_err().to_string(), OFF_HERE);
         // Another session, mid-turn: while c1 is mid-turn too, a call naming no session can't be handed its key.
         assert!(d.hook(call("c2", "prompt", &[])).await.unwrap().address.is_some());
-        assert_eq!(d.attach("cursor", "/work/api").unwrap_err().to_string(), OFF_HERE);
+        assert_eq!(d.attach("cursor", "/work/api").unwrap_err().to_string(), BUSY_OFF);
         assert!(d.hook(call("c1", "stop", &["/work/private"])).await.is_err());
         assert_eq!(d.attach("cursor", "/work/api").unwrap().as_deref(), Some("cursor:c2"));
+        // Once its folders are all on again, it is a session like any other.
+        assert!(d.hook(call("c1", "prompt", &[])).await.unwrap().address.is_some());
+        assert!(d.inner.lock().unwrap().live.contains_key("cursor:c1"));
     }
 }

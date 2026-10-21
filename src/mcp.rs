@@ -302,7 +302,7 @@ impl ReasonNetworkMcp {
         if meta_id.is_none() && agent::multiplexed(agent) {
             match self.link.call::<Option<String>>(Request::Attach { agent: agent.into(), cwd: agent::cwd() }).await {
                 Ok(Some(key)) => return Ok(key),
-                Err(e) if e.to_string() == OFF_HERE => anyhow::bail!(OFF_HERE),
+                Err(e) if e.to_string() == crate::config::BUSY_OFF => anyhow::bail!(crate::config::BUSY_OFF),
                 _ => {}
             }
         }
