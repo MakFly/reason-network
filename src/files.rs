@@ -128,12 +128,12 @@ fn read_from(
         if let Some(c) = confine {
             path = c.allow(p, &path)?;
         }
-        // Where the file really is (links followed), whichever folder the command runs in.
-        if let Some(cfg) = folders {
-            path = std::fs::canonicalize(&path).map_err(|_| anyhow!("can't read {p}"))?;
-            if cfg.off_in(&path.display().to_string()) {
-                return Err(in_off_folder(p));
-            }
+        // Judged by where the file really is (links followed), whichever folder the command runs in; read, and named,
+        // as given.
+        if let Some(cfg) = folders
+            && std::fs::canonicalize(&path).is_ok_and(|r| cfg.off_in(&r.display().to_string()))
+        {
+            return Err(in_off_folder(p));
         }
         // Asked before opening, too: Windows doesn't open a folder at all ("Access is denied"), which would hide why.
         if std::fs::metadata(&path).is_ok_and(|m| !m.is_file()) {
@@ -716,6 +716,24 @@ mod tests {
         assert_eq!(read_outside(&[plan], &elsewhere, &cfg).unwrap()[0].content, "plan");
         // A person's own `send --file` reads anywhere.
         assert_eq!(read(&[full], &elsewhere).unwrap()[0].content, "mine");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Without folders that are off, an agent's shell reads files just as a person's terminal does.
+    #[test]
+    fn with_no_folder_off_an_agents_shell_reads_as_a_person_does() {
+        let d = temp();
+        std::fs::write(d.join("2026-10-20.log"), "log").unwrap();
+        let none = crate::config::Config::default();
+        let missing = read_outside(&["nope.txt".into()], &d, &none).unwrap_err().to_string();
+        assert_eq!(missing, read(&["nope.txt".into()], &d).unwrap_err().to_string());
+        // A link is sent under its own name.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(d.join("2026-10-20.log"), d.join("current.log")).unwrap();
+            let sent = read_outside(&["current.log".into()], &d, &none).unwrap();
+            assert_eq!((sent[0].name.as_str(), sent[0].content.as_str()), ("current.log", "log"));
+        }
         std::fs::remove_dir_all(&d).unwrap();
     }
 
