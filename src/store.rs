@@ -212,10 +212,9 @@ impl Store {
 
     pub fn unread(&self, recipient: &str) -> Result<Vec<Message>> {
         let mut st = self.db.prepare_cached(&format!(
-            "SELECT {MESSAGE_COLS}, held FROM messages WHERE recipient = ?1 AND read_at IS NULL AND held = 0 ORDER BY sent_at, id"
+            "SELECT {MESSAGE_COLS}, held FROM messages WHERE recipient = ?1 AND read_at IS NULL AND held = 0 ORDER BY sent_at, id LIMIT 100"
         ))?;
-        let rows = st.query_map([recipient], |r| self.row(r))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        self.inbox_rows(st.query([recipient])?)
     }
 
     pub fn unread_count(&self, recipient: &str) -> Result<u32> {
@@ -228,22 +227,40 @@ impl Store {
 
     pub fn held(&self) -> Result<Vec<Message>> {
         let mut st = self.db.prepare_cached(&format!(
-            "SELECT {MESSAGE_COLS}, held FROM messages WHERE held = 1 ORDER BY sent_at, id"
+            "SELECT {MESSAGE_COLS}, held FROM messages WHERE held = 1 ORDER BY sent_at, id LIMIT 100"
         ))?;
-        let rows = st.query_map([], |r| self.row(r))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        self.inbox_rows(st.query([])?)
     }
 
-    /// The bytes of teammates' files this machine keeps: saved, or held for approval.
-    pub fn files_kept(&self) -> Result<usize> {
-        let sql = "SELECT COALESCE(SUM(json_extract(files, '$.bytes')), 0) FROM messages WHERE files IS NOT NULL";
+    fn inbox_rows(&self, mut rows: rusqlite::Rows<'_>) -> Result<Vec<Message>> {
+        let mut messages = Vec::new();
+        let mut bytes = 0;
+        while let Some(r) = rows.next()? {
+            let size = r.get_ref(7)?.as_str()?.len() + r.get_ref(11)?.as_str().map_or(0, str::len);
+            // Always let one through so a large message saved by an older version cannot block the inbox.
+            if !messages.is_empty() && bytes + size > 1024 * 1024 {
+                break;
+            }
+            bytes += size;
+            messages.push(self.row(r)?);
+        }
+        Ok(messages)
+    }
+
+    /// The bytes this machine keeps for teammates: files, and the bodies of mail not read yet or held for approval
+    /// (read mail is out of the way and must not use up the quota).
+    pub fn bytes_kept(&self) -> Result<usize> {
+        let sql = "SELECT COALESCE(SUM(CASE WHEN read_at IS NULL OR held = 1 THEN length(CAST(body AS BLOB)) ELSE 0 END
+                   + COALESCE(json_extract(files, '$.bytes'), 0)), 0)
+                   FROM messages";
         Ok(self.db.query_row(sql, [], |r| r.get::<_, i64>(0))?.max(0) as usize)
     }
 
-    /// The same, of files from `person`'s sessions.
-    pub fn files_kept_from(&self, person: &str) -> Result<usize> {
-        let sql = "SELECT COALESCE(SUM(json_extract(files, '$.bytes')), 0) FROM messages
-                   WHERE files IS NOT NULL AND substr(sender, 1, length(?1) + 1) = ?1 || '/'";
+    /// The same, from `person`'s sessions.
+    pub fn bytes_kept_from(&self, person: &str) -> Result<usize> {
+        let sql = "SELECT COALESCE(SUM(CASE WHEN read_at IS NULL OR held = 1 THEN length(CAST(body AS BLOB)) ELSE 0 END
+                   + COALESCE(json_extract(files, '$.bytes'), 0)), 0)
+                   FROM messages WHERE substr(sender, 1, length(?1) + 1) = ?1 || '/'";
         Ok(self.db.query_row(sql, [person], |r| r.get::<_, i64>(0))?.max(0) as usize)
     }
 
@@ -341,8 +358,8 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok().and_then(|s| serde_json::from_str(&s).ok())).collect())
     }
 
-    pub fn outbox_done(&self, id: &str) -> Result<()> {
-        self.db.execute("DELETE FROM outbox WHERE id = ?1", [id])?;
+    pub fn outbox_done(&self, target: &str, id: &str) -> Result<()> {
+        self.db.execute("DELETE FROM outbox WHERE id = ?1 AND target = ?2", [id, target])?;
         Ok(())
     }
 
@@ -651,6 +668,17 @@ mod tests {
         Attachment { name: name.into(), content: content.into(), path: None }
     }
 
+    #[test]
+    fn only_the_target_machine_takes_a_message_off_the_outbox() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let m = with_files("01OUT", "bob/api");
+        store.outbox_add("bob-machine", &m).unwrap();
+        store.outbox_done("mallory-machine", "01OUT").unwrap();
+        assert_eq!(store.outbox_for("bob-machine", m.sent_at).unwrap().len(), 1);
+        store.outbox_done("bob-machine", "01OUT").unwrap();
+        assert!(store.outbox_for("bob-machine", m.sent_at).unwrap().is_empty());
+    }
+
     fn with_files(id: &str, to: &str) -> Message {
         Message {
             id: id.into(),
@@ -666,6 +694,72 @@ mod tests {
             sent_at: 0,
             approval: None,
             files: vec![file("notes.md", "# notes\n"), file("run.log", "ok\n")],
+        }
+    }
+
+    #[test]
+    fn body_bytes_count_toward_both_quotas_even_when_held() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        for (id, held) in [("1", false), ("2", true)] {
+            let mut m = with_files(id, "lars/api");
+            m.body = "é\0hi".into();
+            m.files.clear();
+            store.insert(&mut m, held).unwrap();
+        }
+        let mut other = with_files("3", "lars/api");
+        other.from = "sv/terminal".into();
+        other.body = "hi".into();
+        other.files.clear();
+        store.insert(&mut other, false).unwrap();
+        let (kept, sender) = (store.bytes_kept().unwrap(), store.bytes_kept_from("sven").unwrap());
+        assert_eq!((kept, sender, store.bytes_kept_from("sv").unwrap()), (12, 10, 2));
+        let mut quota = files::Quota::default();
+        let now = std::time::Instant::now();
+        assert!(
+            quota
+                .admit("sven", files::QUOTA_SENDER_KEPT - sender + 1, kept, sender, now)
+                .unwrap_err()
+                .contains("25 MB of messages from sven")
+        );
+        assert!(
+            quota
+                .admit("sven", files::QUOTA_TOTAL - kept + 1, kept, sender, now)
+                .unwrap_err()
+                .contains("100 MB of messages at most")
+        );
+    }
+
+    #[test]
+    fn inbox_batches_bound_rows_and_bytes_without_losing_mail() {
+        for held in [false, true] {
+            for size in [1, 64 * 1024, 2 * 1024 * 1024] {
+                let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+                let count = if size == 1 { 101 } else { 17 };
+                for i in 0..count {
+                    let mut m = with_files(&format!("{i:03}"), "lars/api");
+                    m.body = "x".repeat(size);
+                    m.files.clear();
+                    store.insert(&mut m, held).unwrap();
+                }
+                let read = || if held { store.held().unwrap() } else { store.unread("lars/api").unwrap() };
+                let batch = read();
+                let expected = if size == 1 {
+                    100
+                } else if size == 64 * 1024 {
+                    16
+                } else {
+                    1
+                };
+                assert_eq!(batch.len(), expected);
+                assert_eq!(batch[0].id, "000");
+                let ids: Vec<String> = batch.into_iter().map(|m| m.id).collect();
+                if held {
+                    assert_eq!(store.settle_held(&ids, false).unwrap().0.len(), expected);
+                } else {
+                    store.mark_read(&ids, 1).unwrap();
+                }
+                assert_eq!(read()[0].id, format!("{expected:03}"));
+            }
         }
     }
 
@@ -823,10 +917,11 @@ mod tests {
         store.insert(&mut with_files("01HELD", "lars/api"), true).unwrap();
         std::fs::create_dir_all(inbox.join("01ORPHAN")).unwrap();
         // What they take counts against the quota: saved or held.
-        let one = files::size(&with_files("x", "y").files);
-        assert_eq!(store.files_kept().unwrap(), 5 * one);
+        let body = with_files("x", "y").body.len();
+        let one = body + files::size(&with_files("x", "y").files);
+        assert_eq!(store.bytes_kept().unwrap(), 5 * one);
         // Counted per sending person too (`sven/claude` sent them all; `sv` is someone else).
-        assert_eq!((store.files_kept_from("sven").unwrap(), store.files_kept_from("sv").unwrap()), (5 * one, 0));
+        assert_eq!((store.bytes_kept_from("sven").unwrap(), store.bytes_kept_from("sv").unwrap()), (5 * one, 0));
         // The unread mail of a session forgotten after a day goes, and its files with it.
         store.forget_sessions(i64::MAX, &HashSet::from(["api"]), "lars").unwrap();
         assert!(!folder(&gone).exists());
@@ -836,14 +931,15 @@ mod tests {
         store.mark_read(&["01OLD".into()], now - day - 1).unwrap();
         store.sweep_files(now).unwrap();
         assert_eq!(folders(&inbox), HashSet::from([stored["01UNREAD"].clone(), stored["01RECENT"].clone()]));
-        assert_eq!(store.files_kept().unwrap(), 3 * one);
+        // Read mail's bodies no longer count; its files do while they are kept.
+        assert_eq!(store.bytes_kept().unwrap(), 3 * one - body);
         // A week on: unread files go (the message stays, without them), and so does a message held with files.
         store.sweep_files(now + files::KEEP_UNREAD_MS + 1).unwrap();
         assert!(folders(&inbox).is_empty());
         assert!(store.unread("lars/api").unwrap().iter().all(|m| m.files.is_empty()));
         assert_eq!(store.unread_count("lars/api").unwrap(), 1);
         assert!(store.held().unwrap().is_empty());
-        assert_eq!(store.files_kept().unwrap(), 0);
+        assert_eq!(store.bytes_kept().unwrap(), body);
         std::fs::remove_dir_all(&inbox).unwrap();
     }
 }

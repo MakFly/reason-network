@@ -33,6 +33,11 @@ pub const ALPN: &[u8] = b"tincan/1";
 pub const JOIN_ALPN: &[u8] = b"tincan/join/1";
 const PROTO: u32 = 1;
 const MAX_FRAME: usize = 4 << 20;
+const MAX_JOIN_FRAME: usize = 8 << 10;
+const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Frames waiting to go out on one link. This machine's own traffic takes at most half, so answers to the peer always
+/// have room; a peer that fills the rest is sending without reading, and loses the link.
+const LINK_QUEUE: usize = 128;
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Two machines that dial each other at once open their connections within this long of each other.
 const DIALED_TOGETHER: Duration = Duration::from_secs(5);
@@ -112,11 +117,29 @@ pub struct LinkInfo {
 #[derive(Clone)]
 struct Link {
     id: u64,
-    tx: mpsc::UnboundedSender<Wire>,
+    tx: mpsc::Sender<Wire>,
     conn: Connection,
     dialer: EndpointId,
     since: Instant,
 }
+
+impl Link {
+    /// Queues this machine's own traffic if there is room for it; what doesn't fit goes at the next flush or tick.
+    fn offer(&self, w: Wire) -> bool {
+        self.tx.capacity() > LINK_QUEUE / 2 && self.tx.try_send(w).is_ok()
+    }
+
+    /// Queues an answer to the peer; a full queue means the peer stopped reading, so the link goes.
+    fn send(&self, w: Wire) -> Result<()> {
+        if self.tx.try_send(w).is_err() {
+            self.conn.close(429u32.into(), b"outbound queue unavailable");
+            bail!("outbound queue unavailable");
+        }
+        Ok(())
+    }
+}
+
+type AckWaiters = HashMap<(EndpointId, String), oneshot::Sender<(String, String)>>;
 
 pub struct Net {
     endpoint: Endpoint,
@@ -129,7 +152,7 @@ pub struct Net {
     daemon: Weak<Daemon>,
     links: Mutex<HashMap<EndpointId, Link>>,
     remote: Mutex<HashMap<EndpointId, Remote>>,
-    acks: Mutex<HashMap<String, oneshot::Sender<(String, String)>>>,
+    acks: Mutex<AckWaiters>,
     dialing: Mutex<HashSet<EndpointId>>,
     wake: Notify,
     /// A local session came or went: announce it now, not at the next tick.
@@ -204,10 +227,19 @@ async fn write_frame<T: Serialize>(send: &mut SendStream, v: &T) -> Result<()> {
 }
 
 async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T> {
+    read_frame_limit(recv, MAX_FRAME).await
+}
+
+async fn read_frame_limit<T: DeserializeOwned>(
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
+    limit: usize,
+) -> Result<T> {
+    use tokio::io::AsyncReadExt;
+
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await?;
     let n = u32::from_be_bytes(len) as usize;
-    if n > MAX_FRAME {
+    if n > limit {
         bail!("frame of {n} bytes is too large");
     }
     let mut buf = vec![0; n];
@@ -376,9 +408,9 @@ impl ProtocolHandler for JoinProto {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let Some(net) = self.0.upgrade() else { return Ok(()) };
         let joiner = conn.remote_id();
-        let res: Result<()> = async {
+        let res = tokio::time::timeout(JOIN_TIMEOUT, async {
             let (mut send, mut recv) = conn.accept_bi().await?;
-            let req: JoinRequest = read_frame(&mut recv).await?;
+            let req: JoinRequest = read_frame_limit(&mut recv, MAX_JOIN_FRAME).await?;
             let daemon = net.daemon.upgrade().ok_or_else(|| anyhow!("shutting down"))?;
             let (reply, joined) = match daemon.redeem(joiner, &req) {
                 Ok(state) => {
@@ -389,15 +421,22 @@ impl ProtocolHandler for JoinProto {
             };
             write_frame(&mut send, &reply).await?;
             send.finish()?;
-            let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
-            if joined && let Some(code) = self.1 {
-                net.close_invite(&code);
+            anyhow::Ok(joined)
+        })
+        .await
+        .map_err(|_| anyhow!("join handshake timed out"))
+        .and_then(|r| r);
+        match res {
+            Ok(joined) => {
+                let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+                if joined && let Some(code) = self.1 {
+                    net.close_invite(&code);
+                }
             }
-            Ok(())
-        }
-        .await;
-        if let Err(e) = res {
-            log(&format!("join from {}: {e:#}", joiner.fmt_short()));
+            Err(e) => {
+                conn.close(408u32.into(), b"join handshake failed");
+                log(&format!("join from {}: {e:#}", joiner.fmt_short()));
+            }
         }
         Ok(())
     }
@@ -504,7 +543,7 @@ impl Net {
 
     pub fn broadcast(&self, w: &Wire) {
         for (peer, l) in self.links.lock().unwrap().iter() {
-            let _ = l.tx.send(for_peer(w, peer));
+            l.offer(for_peer(w, peer));
         }
     }
 
@@ -542,17 +581,18 @@ impl Net {
     /// Sends a message and waits briefly for the receiving machine's verdict. `None`: not connected or no
     /// answer in time; the caller keeps it in the outbox.
     pub async fn send_msg(&self, target: &EndpointId, msg: &Message) -> Option<(String, String)> {
-        let tx = self.links.lock().unwrap().get(target).map(|l| l.tx.clone())?;
+        let link = self.links.lock().unwrap().get(target).cloned()?;
         let (otx, orx) = oneshot::channel();
-        self.acks.lock().unwrap().insert(msg.id.clone(), otx);
-        if tx.send(Wire::Msg { msg: msg.clone() }).is_err() {
-            self.acks.lock().unwrap().remove(&msg.id);
+        let key = (*target, msg.id.clone());
+        self.acks.lock().unwrap().insert(key.clone(), otx);
+        if !link.offer(Wire::Msg { msg: msg.clone() }) {
+            self.acks.lock().unwrap().remove(&key);
             return None;
         }
         match tokio::time::timeout(ACK_TIMEOUT, orx).await {
             Ok(Ok(verdict)) => Some(verdict),
             _ => {
-                self.acks.lock().unwrap().remove(&msg.id);
+                self.acks.lock().unwrap().remove(&key);
                 None
             }
         }
@@ -648,11 +688,13 @@ impl Net {
             if flushed.elapsed() > Duration::from_secs(30) {
                 flushed = Instant::now();
                 let stale = util::now_ms() - 20_000;
-                let links: Vec<(EndpointId, mpsc::UnboundedSender<Wire>)> =
-                    self.links.lock().unwrap().iter().map(|(id, l)| (*id, l.tx.clone())).collect();
-                for (id, tx) in links {
+                let links: Vec<(EndpointId, Link)> =
+                    self.links.lock().unwrap().iter().map(|(id, l)| (*id, l.clone())).collect();
+                for (id, link) in links {
                     for msg in daemon.outbox_for(&id).into_iter().filter(|m| m.sent_at < stale) {
-                        let _ = tx.send(Wire::Msg { msg });
+                        if !link.offer(Wire::Msg { msg }) {
+                            break;
+                        }
                     }
                 }
             }
@@ -668,8 +710,9 @@ impl Net {
 
         // Both sides may dial at once. Both keep the connection dialed by the smaller id.
         let dialer = if outgoing { self.me } else { peer };
-        let (tx, mut rx) = mpsc::unbounded_channel::<Wire>();
+        let (tx, mut rx) = mpsc::channel(LINK_QUEUE);
         let id = self.next_link.fetch_add(1, Ordering::Relaxed);
+        let link = Link { id, tx, conn: conn.clone(), dialer, since: Instant::now() };
         {
             let mut links = self.links.lock().unwrap();
             if let Some(old) = links.get(&peer) {
@@ -680,7 +723,7 @@ impl Net {
                 }
                 old.conn.close(0u32.into(), b"replaced");
             }
-            links.insert(peer, Link { id, tx: tx.clone(), conn: conn.clone(), dialer, since: Instant::now() });
+            links.insert(peer, link.clone());
         }
         log(&format!("connected to {} ({})", peer.fmt_short(), if outgoing { "out" } else { "in" }));
 
@@ -692,29 +735,30 @@ impl Net {
             }
             let _ = send.finish();
         });
-        let _ = tx.send(Wire::Hello { team, proto: PROTO });
-        if let Some(state) = daemon.team_state() {
-            let _ = tx.send(for_peer(&Wire::State { state: Box::new(state) }, &peer));
-        }
-        let _ = tx.send(Wire::Presence { presence: daemon.presence().await });
-        for msg in daemon.outbox_for(&peer) {
-            let _ = tx.send(Wire::Msg { msg });
-        }
-        drop(daemon);
-
-        let res = loop {
-            match read_frame::<Wire>(&mut recv).await {
-                Ok(w) => {
-                    if let Err(e) = self.on_wire(peer, &tx, w).await {
-                        break Err(e);
-                    }
-                }
-                Err(e) => {
-                    log(&format!("{} disconnected: {e:#}", peer.fmt_short()));
-                    break Ok(());
+        let res = async {
+            link.offer(Wire::Hello { team, proto: PROTO });
+            if let Some(state) = daemon.team_state() {
+                link.offer(for_peer(&Wire::State { state: Box::new(state) }, &peer));
+            }
+            link.offer(Wire::Presence { presence: daemon.presence().await });
+            for msg in daemon.outbox_for(&peer) {
+                if !link.offer(Wire::Msg { msg }) {
+                    break;
                 }
             }
-        };
+            drop(daemon);
+
+            loop {
+                match read_frame::<Wire>(&mut recv).await {
+                    Ok(w) => self.on_wire(peer, &link, w).await?,
+                    Err(e) => {
+                        log(&format!("{} disconnected: {e:#}", peer.fmt_short()));
+                        break Ok(());
+                    }
+                }
+            }
+        }
+        .await;
         {
             let mut links = self.links.lock().unwrap();
             if links.get(&peer).is_some_and(|l| l.id == id) {
@@ -729,7 +773,7 @@ impl Net {
         res
     }
 
-    async fn on_wire(&self, peer: EndpointId, tx: &mpsc::UnboundedSender<Wire>, w: Wire) -> Result<()> {
+    async fn on_wire(&self, peer: EndpointId, link: &Link, w: Wire) -> Result<()> {
         let daemon = self.daemon.upgrade().ok_or_else(|| anyhow!("shutting down"))?;
         if !daemon.is_member(&peer) {
             bail!("{} is no longer a member", peer.fmt_short());
@@ -750,19 +794,22 @@ impl Net {
                 self.remote.lock().unwrap().insert(peer, rem);
             }
             Wire::Msg { msg } => {
+                if msg.id.len() > 26 {
+                    bail!("message id is too long");
+                }
                 let id = msg.id.clone();
                 let (state, note) = match daemon.receive(peer, msg) {
                     Ok(v) => v,
                     Err(e) => ("refused".into(), format!("{e:#}")),
                 };
-                let _ = tx.send(Wire::Ack { id, state, note });
+                link.send(Wire::Ack { id, state, note })?;
             }
             Wire::Ack { id, state, note } => {
                 // "retry": the other side is busy; keep it in the outbox for the next flush.
                 if state != "retry" {
-                    daemon.outbox_done(&id);
+                    daemon.outbox_done(&peer, &id);
                 }
-                if let Some(waiter) = self.acks.lock().unwrap().remove(&id) {
+                if let Some(waiter) = self.acks.lock().unwrap().remove(&(peer, id)) {
                     let _ = waiter.send((state, note));
                 }
             }
@@ -809,6 +856,73 @@ fn tidy_presence(mut p: Presence) -> Presence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_full_link_queue_closes_the_connection() {
+        let server = Endpoint::builder(presets::Minimal).alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
+        let client = Endpoint::builder(presets::Minimal).bind().await.unwrap();
+        let (conn, remote) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(client.connect(server.addr(), ALPN), async { server.accept().await.unwrap().await })
+        })
+        .await
+        .unwrap();
+        let conn = conn.unwrap();
+        let _remote = remote.unwrap();
+        let (tx, mut rx) = mpsc::channel(LINK_QUEUE);
+        let link = Link { id: 1, tx, conn, dialer: client.id(), since: Instant::now() };
+        let ack = Wire::Ack { id: ulid::Ulid::new().to_string(), state: "stored".into(), note: String::new() };
+        // This machine's own traffic stops at half the queue and never costs the link.
+        let mut offered = 0;
+        while link.offer(ack.clone()) {
+            offered += 1;
+        }
+        assert_eq!(offered, LINK_QUEUE / 2);
+        assert!(link.conn.close_reason().is_none());
+        for _ in offered..LINK_QUEUE {
+            link.send(ack.clone()).unwrap();
+        }
+        assert!(link.conn.close_reason().is_none());
+        assert!(link.send(ack).is_err());
+        assert!(link.conn.close_reason().is_some());
+        assert_eq!(rx.len(), LINK_QUEUE);
+        for _ in 0..LINK_QUEUE {
+            assert!(matches!(rx.try_recv(), Ok(Wire::Ack { .. })));
+        }
+        assert!(rx.try_recv().is_err());
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn an_oversized_join_frame_is_rejected_before_reading_its_body() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut send, mut recv) = tokio::io::duplex(4);
+        send.write_all(&((MAX_JOIN_FRAME + 1) as u32).to_be_bytes()).await.unwrap();
+        // The sender keeps the stream open without sending the advertised body.
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), read_frame_limit::<JoinRequest>(&mut recv, MAX_JOIN_FRAME))
+                .await
+                .unwrap()
+                .unwrap_err();
+        assert!(error.to_string().contains("too large"));
+
+        let req = JoinRequest {
+            team: "team".into(),
+            secret: "00".repeat(16),
+            person: "alex".into(),
+            machine: "mini".into(),
+            proof: Some("x".repeat(4096)),
+            owner_only: false,
+        };
+        let mut body = serde_json::to_vec(&req).unwrap();
+        assert!(body.len() < MAX_JOIN_FRAME);
+        body.resize(MAX_JOIN_FRAME, b' ');
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend(body);
+        let parsed: JoinRequest = read_frame_limit(&mut frame.as_slice(), MAX_JOIN_FRAME).await.unwrap();
+        assert_eq!(parsed.proof, req.proof);
+    }
 
     #[test]
     fn a_teammates_presence_cant_open_a_frame() {

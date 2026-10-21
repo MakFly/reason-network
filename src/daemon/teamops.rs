@@ -99,8 +99,9 @@ impl Daemon {
         self.inner.lock().unwrap().store.outbox_for(&id.to_string(), util::now_ms()).unwrap_or_default()
     }
 
-    pub fn outbox_done(&self, id: &str) {
-        let _ = self.inner.lock().unwrap().store.outbox_done(id);
+    /// `peer` answered for message `id`: only the machine it was sent to can take it off the outbox.
+    pub fn outbox_done(&self, peer: &EndpointId, id: &str) {
+        let _ = self.inner.lock().unwrap().store.outbox_done(&peer.to_string(), id);
     }
 
     /// Takes in a teammate's copy of the team state, passing it on if it taught us something.

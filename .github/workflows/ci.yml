@@ -6,6 +6,20 @@ on:
   pull_request:
 
 jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: cargo audit
+
   test:
     strategy:
       fail-fast: false
