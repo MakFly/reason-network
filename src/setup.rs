@@ -1464,6 +1464,15 @@ pub async fn doctor() -> Result<()> {
         }
         Err(e) => println!("✗ daemon: {}", crate::shown(&format!("{e:#}"))),
     }
+    let cfg = crate::config::Config::load();
+    let (odd, off): (Vec<_>, Vec<_>) = cfg.folders.iter().partition(|e| cfg.odd_folders().contains(e));
+    if !off.is_empty() {
+        println!("- Reason Network is off in {}", off.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", "));
+    }
+    for (k, v) in odd {
+        let why = if v == "off" { "not a full path" } else { "\"off\" is the only setting so far" };
+        println!("  ! folders: \"{k}\" = \"{v}\" is ignored: {why}");
+    }
     let svc = service_installed();
     println!(
         "{} login service: {}",

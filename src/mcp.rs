@@ -3,6 +3,7 @@
 use crate::{
     agent::{self, ClaudeSocket},
     client::Link,
+    config::OFF_HERE,
     proto::*,
     render,
 };
@@ -117,6 +118,7 @@ pub async fn run() -> Result<()> {
         tokio::time::sleep(Duration::from_secs(3)).await;
         let agent = s.agent(&peer, None);
         if !agent::multiplexed(agent)
+            && !off_here()
             && let Err(e) = s.session(agent, None).await
         {
             eprintln!("reason-network: registering session: {e:#}");
@@ -294,12 +296,15 @@ impl ReasonNetworkMcp {
 
     /// Registers the session on first use and returns its key.
     async fn session(&self, agent: &'static str, meta_id: Option<String>) -> Result<String> {
-        if meta_id.is_none()
-            && agent::multiplexed(agent)
-            && let Ok(Some(key)) =
-                self.link.call::<Option<String>>(Request::Attach { agent: agent.into(), cwd: agent::cwd() }).await
-        {
-            return Ok(key);
+        if off_here() {
+            anyhow::bail!(OFF_HERE);
+        }
+        if meta_id.is_none() && agent::multiplexed(agent) {
+            match self.link.call::<Option<String>>(Request::Attach { agent: agent.into(), cwd: agent::cwd() }).await {
+                Ok(Some(key)) => return Ok(key),
+                Err(e) if e.to_string() == crate::config::BUSY_OFF => anyhow::bail!(crate::config::BUSY_OFF),
+                _ => {}
+            }
         }
         let id = meta_id.or_else(|| agent::env_session_id(agent));
         let key = match &id {
@@ -365,6 +370,11 @@ impl ReasonNetworkMcp {
     }
 }
 
+/// Whether this session's folder is off the network (read each time: `folder` may have changed it since).
+fn off_here() -> bool {
+    crate::config::Config::load_strict().unwrap_or_default().off_in(&agent::cwd())
+}
+
 /// The files an agent asked to send, read only from its own folder: its repository (or where it works), none of its
 /// hidden files, nothing where credentials or Reason Network's state are kept. A person's `send --file` has no such
 /// limit; an agent can be talked into sending what its harness wouldn't let it read.
@@ -375,7 +385,8 @@ fn agent_files(paths: &[String]) -> Result<Vec<Attachment>> {
     let cwd = agent::cwd();
     let root = crate::git::lookup(&cwd).root.unwrap_or_else(|| cwd.clone());
     let confine =
-        crate::files::Confine::new(std::path::Path::new(&root), &crate::paths::user_home(), &crate::paths::home())?;
+        crate::files::Confine::new(std::path::Path::new(&root), &crate::paths::user_home(), &crate::paths::home())?
+            .with_folders(crate::config::Config::load_strict().unwrap_or_default());
     crate::files::read_within(paths, std::path::Path::new(&cwd), &confine)
 }
 

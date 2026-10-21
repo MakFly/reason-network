@@ -234,6 +234,12 @@ enum Cmd {
     },
     /// Use your own iroh relay for the team, so its machines never contact n0 (or `default` for Reason's relays)
     Relay { url: String },
+    /// Keep the agent sessions in a folder (and the folders in it) off the network, or put them back on
+    Folder {
+        path: String,
+        #[arg(value_parser = ["off", "on"])]
+        state: String,
+    },
     /// List messages waiting for your approval (when `inbound` is `hold`)
     Held,
     /// Deliver held messages
@@ -353,18 +359,40 @@ async fn main() -> Result<()> {
 /// A session driven from the command line (`reason network listen --as <id>`, or `terminal` for plain-terminal sends): kept
 /// alive like a hook-known session, so it stays reachable between commands.
 async fn cli_session(link: &std::sync::Arc<Link>, id: &str, event: &str) -> Result<HookReply> {
+    let mut cwd = agent::cwd();
+    if id == "terminal" {
+        cwd = terminal_cwd(cwd, here_off(), agent_shell())?;
+    }
     let req = Request::Hook(HookCall {
         agent: "cli".into(),
         event: event.into(),
         session_id: id.into(),
-        cwd: Some(agent::cwd()),
+        cwd: Some(cwd),
         pid: None,
         mail: false,
         transcript: None,
         doing: None,
         name: Some(id.into()),
+        dirs: Vec::new(),
     });
     link.call(req).await
+}
+
+/// The folder `<you>/terminal` goes by. Folders that are off are about agent sessions, not the person at the terminal:
+/// in one, theirs goes by no folder. An agent's shell there is an agent's session, and gets nothing.
+fn terminal_cwd(cwd: String, off: bool, agent: bool) -> Result<String> {
+    match (off, agent) {
+        (false, _) => Ok(cwd),
+        (true, false) => Ok("/".into()),
+        (true, true) => bail!(config::OFF_HERE),
+    }
+}
+
+/// Whether this command runs in a folder that is off: by the agent's project folder, or the shell's own.
+fn here_off() -> bool {
+    let cfg = config::Config::load_strict().unwrap_or_default();
+    let shell = std::env::current_dir().ok().map(|p| p.display().to_string());
+    [Some(agent::cwd()), shell].into_iter().flatten().any(|d| cfg.off_in(&d))
 }
 
 fn current_session() -> Option<String> {
@@ -394,6 +422,10 @@ async fn cli(cmd: Cmd) -> Result<()> {
             }
         }
         Cmd::Send { to, message, reply_to, fyi, notify, from, files } => {
+            // An agent in a folder that is off sends nothing, as no session (nor its files).
+            if agent_shell() && here_off() {
+                bail!(config::OFF_HERE);
+            }
             let mut body = message.join(" ");
             if message.is_empty() || body == "-" {
                 body.clear();
@@ -590,6 +622,23 @@ async fn cli(cmd: Cmd) -> Result<()> {
             println!("{}", shown(&link.call::<String>(Request::SetRelay { url }).await?));
             wait_exit(daemon_pid()).await;
         }
+        Cmd::Folder { path, state } => {
+            let off = state == "off";
+            let (name, changed) = config::set_folder(&path, off)?;
+            // The daemon reads the config when it starts.
+            if changed && stop_daemon().await {
+                let _ = Link::new(None).call::<TeamInfo>(Request::Team).await;
+            }
+            if off {
+                println!(
+                    "Reason Network is off in {name}: teammates don't see its sessions and can't message them. `{CLI} folder {name} on` undoes it."
+                );
+            } else if let Some(by) = config::off_by(&name) {
+                println!("{name} is still off: it is in {by}.");
+            } else {
+                println!("Reason Network is on in {name}.");
+            }
+        }
         Cmd::Held => {
             let msgs: Vec<Message> = link.call(Request::Held).await?;
             if msgs.is_empty() {
@@ -690,8 +739,12 @@ fn json_error<T>(json: bool, e: anyhow::Error) -> Result<T> {
 /// Whether a person reads this command's output: it goes to a terminal, and not one an agent runs commands in (some
 /// give their commands one).
 fn person_reads() -> bool {
-    let agent = agent::detect_env().is_some() || agent_vars(std::env::vars_os());
-    reads(std::io::IsTerminal::is_terminal(&std::io::stderr()), agent)
+    reads(std::io::IsTerminal::is_terminal(&std::io::stderr()), agent_shell())
+}
+
+/// Whether an agent's variables are set: its shell, not a person's terminal.
+fn agent_shell() -> bool {
+    agent::detect_env().is_some() || agent_vars(std::env::vars_os())
 }
 
 /// Agents `detect_env` doesn't name: any `REASON_NETWORK_AGENT` (it returns early on one it doesn't know), Pi's
@@ -761,6 +814,13 @@ pub async fn stop_daemon() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_a_folder_that_is_off_the_terminal_goes_by_no_folder_and_an_agents_shell_gets_nothing() {
+        assert_eq!(terminal_cwd("/work/api".into(), false, true).unwrap(), "/work/api");
+        assert_eq!(terminal_cwd("/work/private".into(), true, false).unwrap(), "/");
+        assert_eq!(terminal_cwd("/work/private".into(), true, true).unwrap_err().to_string(), config::OFF_HERE);
+    }
 
     #[test]
     fn a_person_at_the_terminal_sees_text_as_typed_anyone_else_defanged() {

@@ -77,6 +77,9 @@ pub struct HookCall {
     /// The session's name, for sessions that pick one (`reason network listen --as`).
     #[serde(default)]
     pub name: Option<String>,
+    /// Every folder the agent says the session is in (besides `cwd`): one turned off keeps it off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dirs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

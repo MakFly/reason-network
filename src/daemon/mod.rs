@@ -134,6 +134,8 @@ struct Inner {
     swept: i64,
     /// Teammates' files taken in the last hour, for the quota.
     quota: crate::files::Quota,
+    /// Sessions whose hooks say they are in a folder that is off: whether each is mid-turn, and when it last said.
+    off: HashMap<String, (bool, i64)>,
 }
 
 /// A session running on this machine.
@@ -173,11 +175,12 @@ pub fn load_key() -> Result<SecretKey> {
 
 impl Daemon {
     fn open() -> Result<Self> {
-        let cfg = Config::load();
-        let store = Store::open(&paths::db(), paths::inbox())?;
+        Self::with(Config::load(), Store::open(&paths::db(), paths::inbox())?, load_key()?)
+    }
+
+    fn with(cfg: Config, store: Store, key: SecretKey) -> Result<Self> {
         let team: Option<TeamState> =
             store.get("team")?.and_then(|s| serde_json::from_str(&s).ok()).map(TeamState::without_odd_names);
-        let key = load_key()?;
         // In a team, who we are is what the signed roster says, whatever the config file says.
         let member = team.as_ref().and_then(|t| t.member(&key.public()).cloned());
         Ok(Daemon {
@@ -196,6 +199,7 @@ impl Daemon {
                 pairs: HashMap::new(),
                 swept: 0,
                 quota: Default::default(),
+                off: HashMap::new(),
             }),
             arrived: Notify::new(),
             git_cache: Mutex::new(HashMap::new()),
@@ -302,7 +306,7 @@ impl Daemon {
                 Value::Null
             }
             Request::Hook(h) => json!(self.hook(h).await?),
-            Request::Attach { agent, cwd } => json!(self.attach(&agent, &cwd)),
+            Request::Attach { agent, cwd } => json!(self.attach(&agent, &cwd)?),
             Request::CreateTeam { name, person, relay, proof } => {
                 json!(self.create_team(&name, &person, relay, proof).await?)
             }
@@ -364,4 +368,12 @@ impl Daemon {
         self.git_cache.lock().unwrap().insert(cwd.to_string(), (Instant::now(), info.clone()));
         info
     }
+}
+
+/// A daemon on an in-memory store, outside any team, with `cfg`.
+#[cfg(test)]
+fn test_daemon(cfg: Config) -> Daemon {
+    let inbox = std::env::temp_dir().join(format!("reason-network-inbox-{}", ulid::Ulid::new()));
+    let store = Store::open(std::path::Path::new(":memory:"), inbox).unwrap();
+    Daemon::with(cfg, store, SecretKey::generate()).unwrap()
 }
